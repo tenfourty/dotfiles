@@ -1,6 +1,6 @@
 [user]
-  name = Jeff Geerling
-  email = geerlingguy@mac.com
+  name = Jeremy Brown
+  email = jeremy@tenfourty.com
 [core]
   editor = vi
   excludesfile = ~/.gitignore
