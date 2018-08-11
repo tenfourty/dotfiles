@@ -8,6 +8,9 @@
 # archey displays a really nice splash on my shell
 archey
 
+LANG="en_US.UTF-8"
+export LANG
+
 # Nicer prompt.
 export PS1="\[\e[0;32m\]\]\[\] \[\e[1;32m\]\]\t \[\e[0;2m\]\]\w \[\e[0m\]\]\[$\] "
 
