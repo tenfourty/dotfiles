@@ -17,7 +17,13 @@ sudo dnf install chezmoi age            # or the local equivalent
 
 # 1. Restore the age identity from the Dashlane secure note
 #    titled "chezmoi dotfiles — age identity".
+#
+#    NOTE: `dcli note` reads a LOCAL vault copy. Without `dcli sync` first you
+#    can silently restore a stale version of the note — observed in practice:
+#    an edit made in the Dashlane app still returned the old 1-line content
+#    until a sync was run, after which it returned the correct 3 lines.
 mkdir -p ~/.config/chezmoi
+dcli sync
 dcli note -o json "chezmoi" | jq -r '.[0].content' > ~/.config/chezmoi/key.txt
 chmod 600 ~/.config/chezmoi/key.txt
 
