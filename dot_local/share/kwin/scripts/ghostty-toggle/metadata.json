@@ -1,0 +1,14 @@
+{
+  "KPlugin": {
+    "Id": "ghostty-toggle",
+    "Name": "Ghostty Toggle",
+    "Description": "Ctrl+/ switches to Ghostty; press again to return where you were",
+    "Version": "1.0",
+    "License": "MIT",
+    "Authors": [{ "Name": "local" }],
+    "EnabledByDefault": true
+  },
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js",
+  "KPackageStructure": "KWin/Script"
+}

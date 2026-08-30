@@ -1,0 +1,23 @@
+[$Version]
+update_info=kwinrules.upd:replace-placement-string-to-enum,kwinrules.upd:use-virtual-desktop-ids
+
+[General]
+rules=3c028c2a-d3fb-44b9-b2a0-32dbe4a9d46f,64af21eb-7ffb-43dd-9b84-30a88290ada4
+count=2
+
+[3c028c2a-d3fb-44b9-b2a0-32dbe4a9d46f]
+Description=Ghostty - remember virtual desktop
+desktops=4d252570-145a-4d48-ad7c-dcded2b58da6
+desktopsrule=4
+wmclass=com.mitchellh.ghostty
+wmclassmatch=1
+wmclasscomplete=false
+
+[64af21eb-7ffb-43dd-9b84-30a88290ada4]
+Description=Beeper - place on Desktop 1
+desktops=4d252570-145a-4d48-ad7c-dcded2b58da6
+desktopsrule=2
+wmclass=Beeper
+wmclassmatch=1
+wmclasscomplete=false
+
