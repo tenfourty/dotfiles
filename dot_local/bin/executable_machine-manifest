@@ -56,6 +56,18 @@ mapfile -t EXPLICIT < <(
     echo "      url: \"$url\""
   done
 
+  # dnf5 config-manager writes these to /etc/dnf/repos.override.d/ rather than
+  # editing the .repo files, so capturing the .repo files alone is NOT enough.
+  # Without these, a fresh machine gets Chrome's repo disabled (it ships
+  # enabled=0) and Terra at default priority instead of last-resort.
+  echo "  repo_overrides:"
+  if [ -d /etc/dnf/repos.override.d ]; then
+    sudo awk '
+      /^\[/ { gsub(/[][]/,""); repo=$0; next }
+      /^[a-z_]+=/ && repo != "" { split($0,kv,"="); print "    - repo: " repo; print "      key: " kv[1]; print "      value: " kv[2] }
+    ' /etc/dnf/repos.override.d/*.repo 2>/dev/null
+  fi
+
   echo "  dnf:"
   printf '    - %s\n' "${EXPLICIT[@]}"
 

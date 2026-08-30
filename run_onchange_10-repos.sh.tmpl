@@ -26,3 +26,15 @@ for f in {{ .chezmoi.sourceDir }}/etc-repos/*.repo; do
     sudo install -m 0644 "$f" "$dest"
   fi
 done
+
+# Repo overrides. dnf5 keeps these in /etc/dnf/repos.override.d/ rather than in
+# the .repo files, so copying etc-repos/*.repo does NOT capture them. Without
+# these a fresh machine gets Chrome's repo disabled (it ships enabled=0) and
+# Terra at default priority instead of last-resort.
+#
+# Applied unconditionally: `setopt` is idempotent, and dnf5 has no `--dump`
+# to read the current value back with.
+echo "==> repo options"
+{{ range .packages.repo_overrides -}}
+sudo dnf config-manager setopt {{ .repo }}.{{ .key }}={{ .value }}
+{{ end }}
