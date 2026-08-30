@@ -49,6 +49,14 @@
 ## which filter mode to use by default
 ## possible values: "global", "host", "session", "session-preload", "directory", "workspace"
 ## consider using search.filters to customize the enablement and order of filter modes
+filter_mode_shell_up_key_binding = "directory"   ## set 2026-08-30
+
+## Up-arrow is directory-scoped rather than host-scoped, because directory is
+## what actually matters when recalling a command. The cost, measured in ~ on
+## this machine: "directory" is NOT host-scoped, so roughly a third of results
+## come from wahala/baba/zoomer for the same path. Ctrl-R still uses
+## filter_mode = "host" (+ the --cwd injection in ~/.bashrc.d/zz-atuin.sh).
+## Revert by deleting this line; atuin then falls back to filter_mode.
 filter_mode = "host"                    ## set 2026-08-23 -- see ~/.bashrc.d/zz-atuin.sh
 ## Combined with --cwd "$PWD" injected by the shell wrapper in
 ## ~/.bashrc.d/zz-atuin.sh, this gives "this host, current directory" as the
