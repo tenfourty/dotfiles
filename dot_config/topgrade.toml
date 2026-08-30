@@ -64,6 +64,11 @@
 # Sources: ~/.config/rpm-sync/sources.toml (rpm + bare-binary releases)
 "Out-of-band packages and binaries" = "~/.local/bin/rpm-sync"
 
+# Report-only. Says whether a newer kernel is installed and which services are
+# running against updated libraries. Never restarts anything on its own - act on
+# it with `kexec-latest` (fast kernel jump) or `sudo systemctl restart <unit>`.
+"Restart status" = "~/.local/bin/kexec-latest --check"
+
 [brew]
 #greedy_cask = true
 
