@@ -1,0 +1,6 @@
+# Global git excludes. Migrated from the 2017 dotfiles repo; the macOS-only
+# entries are kept because repos are still shared with Mac users.
+*.DS_Store
+*.LSOverride
+Thumbs.db
+.bundle
