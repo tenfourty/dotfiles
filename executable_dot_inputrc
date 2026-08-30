@@ -1,9 +1,13 @@
-# Allow up/down autocompletion of commands from bash history.
-# From: coderwall.com/p/oqtj8w
-"\e[A": history-search-backward
-"\e[B": history-search-forward
-set show-all-if-ambiguous on
-set completion-ignore-case on
+# Readline settings.
+#
+# NOTE: the 2017 version of this file bound Up/Down to history-search-backward
+# / -forward. Those are deliberately NOT here: atuin owns the arrow keys and
+# Ctrl-R on this machine, and a readline binding on "\e[A" fights it. atuin's
+# search is strictly better anyway (fuzzy, host- and directory-scoped).
+# See ~/.bashrc.d/zz-atuin.sh.
 
-# Uncomment to enable vi-like command line editing mode.
-# set editing-mode vi
+# Show completions immediately when ambiguous rather than requiring a second Tab.
+set show-all-if-ambiguous on
+
+# Tab-complete without worrying about case.
+set completion-ignore-case on
