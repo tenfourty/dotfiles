@@ -1,0 +1,16 @@
+# CLAUDE.md
+
+This machine's setup, conventions, and detailed documentation live in **[AGENTS.md](./AGENTS.md)**.
+
+Read `AGENTS.md` first. It is the canonical entry point and indexes everything
+under [`docs/`](./docs/).
+
+This file exists only to point there, so that both Claude Code and any other
+agent tooling converge on the same source of truth. Do not duplicate content
+here — edit `AGENTS.md` or the relevant file in `docs/` instead.
+
+`~/AGENTS.md` and `~/docs` are symlinks. The files themselves live in
+`~/dev/machines/{{ .chezmoi.hostname }}/`, which syncs to Nextcloud so each machine's docs are
+available from every machine. `~/me` also points there. See `~/dev/README.md`
+for the layout, and note that working git clones belong in `~/repos` — never
+in `~/dev`, which is a sync root.
