@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# User-level tools: cargo (via binstall, never a source build) and uv.
+# manifest hash: {{ include ".chezmoidata/packages.yaml" | sha256sum }}
+set -euo pipefail
+
+if command -v cargo-binstall >/dev/null 2>&1; then
+{{ range .packages.cargo -}}
+  command -v {{ . }} >/dev/null 2>&1 || cargo binstall -y {{ . }}
+{{ end }}
+fi
+
+if command -v uv >/dev/null 2>&1; then
+  have=$(uv tool list 2>/dev/null | awk '/^[a-z]/{print $1}')
+{{ range .packages.uv -}}
+  grep -qx {{ . | quote }} <<<"$have" || uv tool install {{ . }}
+{{ end }}
+fi
+echo "==> user tools checked"

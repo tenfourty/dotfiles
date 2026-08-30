@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Packages beyond the stock Fedora KDE install.
+# manifest hash: {{ include ".chezmoidata/packages.yaml" | sha256sum }}
+set -euo pipefail
+command -v dnf >/dev/null || exit 0
+
+want=({{ range .packages.dnf }}{{ . | quote }} {{ end }})
+missing=()
+for p in "${want[@]}"; do
+  rpm -q "$p" >/dev/null 2>&1 || missing+=("$p")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+  echo "==> installing ${#missing[@]} missing package(s): ${missing[*]}"
+  sudo dnf install -y "${missing[@]}"
+else
+  echo "==> packages: all present"
+fi

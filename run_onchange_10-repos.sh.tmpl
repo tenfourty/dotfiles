@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Third-party repositories and COPRs.
+#
+# run_onchange_: chezmoi re-runs this only when the rendered content below
+# changes, so adding a COPR to .chezmoidata/packages.yaml is enough to trigger
+# a re-run on the next `chezmoi apply`.
+#
+# manifest hash: {{ include ".chezmoidata/packages.yaml" | sha256sum }}
+set -euo pipefail
+command -v dnf >/dev/null || exit 0
+
+echo "==> repositories"
+{{ range .packages.copr -}}
+if ! ls /etc/yum.repos.d/_copr*{{ . | replace "/" ":" }}*.repo >/dev/null 2>&1; then
+  echo "    enabling copr {{ . }}"
+  sudo dnf -y copr enable {{ . }}
+fi
+{{ end }}
+# Vendor repos are restored from committed copies rather than re-derived, so a
+# fresh machine gets exactly the definition this one uses (gpgkey URLs included).
+for f in {{ .chezmoi.sourceDir }}/etc-repos/*.repo; do
+  [ -e "$f" ] || continue
+  dest="/etc/yum.repos.d/$(basename "$f")"
+  if ! sudo cmp -s "$f" "$dest" 2>/dev/null; then
+    echo "    installing $(basename "$f")"
+    sudo install -m 0644 "$f" "$dest"
+  fi
+done

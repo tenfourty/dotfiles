@@ -27,3 +27,7 @@ me
 # Repo documentation, not dotfiles. Without this, chezmoi apply would write
 # README.md into $HOME.
 README.md
+
+# Copies of /etc/yum.repos.d files, consumed by run_onchange_10-repos.sh.
+# Not dotfiles; must never be written into $HOME.
+etc-repos

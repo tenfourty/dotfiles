@@ -42,6 +42,50 @@ encrypted files simply stay encrypted.
 The identity is **one key for all machines**, not one per machine — hence the
 machine-agnostic note title.
 
+## Reproducing this machine
+
+`chezmoi apply` restores dotfiles **and** provisions the system, from
+`.chezmoidata/packages.yaml`:
+
+| Script | Does |
+|---|---|
+| `run_onchange_10-repos.sh` | Enables COPRs; installs the committed `etc-repos/*.repo` files verbatim |
+| `run_onchange_20-packages.sh` | Installs missing dnf packages |
+| `run_onchange_30-flatpak.sh` | Adds flathub, installs missing flatpaks |
+| `run_onchange_40-user-tools.sh` | `cargo binstall` and `uv tool install` |
+
+`run_onchange_` means each script re-runs only when its rendered content
+changes. Every script embeds a hash of the manifest, so editing
+`packages.yaml` re-triggers them all on the next apply. They are idempotent:
+on a machine that already has everything they print "all present" and change
+nothing. Verified.
+
+Regenerate the manifest from the live system:
+
+```sh
+machine-manifest --write && chezmoi apply
+```
+
+The manifest is a **curated draft**, not gospel. dnf does not reliably record
+"the user asked for this" across a system-upgrade chain, so the generator
+filters out kernels, `lib*`/`*-libs` dependencies and packages whose repo
+attribution was lost. Read the diff before committing it.
+
+### What this does NOT reproduce
+
+Honest limits — these need doing by hand on a fresh machine:
+
+- **Disk layout, LUKS, and the passphrase.** Set at install time.
+- **BIOS settings** — Secure Boot, Thunderbolt security level, battery charge
+  thresholds. On Dell these are scriptable from Linux via `dell-wmi-sysman`
+  (see `docs/`), but they need the BIOS admin password.
+- **Kernel command line** — `mem_sleep_default=deep intel_iommu=on iommu=pt`.
+- **KDE settings that KDE rewrites at runtime** — `kwinrc`,
+  `kglobalshortcutsrc`. Version-controlling files a daemon rewrites produces
+  permanent spurious diffs; the settings that matter are documented instead.
+- **Application state and credentials** — browser profiles, Slack, Beeper.
+- **Data.** This repo is config only.
+
 ## Not managed here
 
 - `~/.bashrc.d/50-machine-docs.sh` — written by `~/dev/bootstrap.sh`

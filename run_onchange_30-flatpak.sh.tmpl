@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Flatpak applications.
+# manifest hash: {{ include ".chezmoidata/packages.yaml" | sha256sum }}
+set -euo pipefail
+command -v flatpak >/dev/null || exit 0
+
+flatpak remotes | grep -q '^flathub' || \
+  sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
+installed=$(flatpak list --app --columns=application 2>/dev/null)
+{{ range .packages.flatpak -}}
+grep -qx {{ . | quote }} <<<"$installed" || { echo "    installing {{ . }}"; flatpak install -y flathub {{ . }}; }
+{{ end }}
+echo "==> flatpaks checked"
