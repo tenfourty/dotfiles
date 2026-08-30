@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""rpm-sync - keep out-of-band packages and binaries up to date.
+
+Some upstreams publish an .rpm on every release but never run a yum/dnf
+repository, so dnf can't see updates. Others ship no package at all, just a
+bare binary attached to a GitHub release. Neither is visible to `dnf upgrade`.
+
+This resolves the current artefact for each configured source, compares it with
+what is installed, and installs it if newer.
+
+Two install methods:
+  install = "rpm"     (default) download the .rpm, compare with rpm's own
+                      version ordering, install with dnf
+  install = "binary"  download the asset, chmod +x, place in ~/.local/bin;
+                      the installed version comes from running the binary
+
+Config: ~/.config/rpm-sync/sources.toml   Run: rpm-sync [--check] [name ...]
+"""
+
+import argparse
+import os
+import re
+import json
+import subprocess
+import sys
+import tomllib
+import urllib.error
+import urllib.request
+from urllib.parse import urljoin, urlparse
+from pathlib import Path
+
+CONFIG = Path.home() / ".config/rpm-sync/sources.toml"
+CACHE = Path.home() / ".cache/rpm-sync"
+STATE = CACHE / "state.json"
+BIN_DIR = Path.home() / ".local/bin"
+UA = {"User-Agent": "rpm-sync"}
+
+BOLD, DIM, RED, GREEN, YELLOW, RESET = (
+    ("\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[33m", "\033[0m")
+    if sys.stdout.isatty() else ("",) * 6
+)
+
+
+def fetch(url, binary=False):
+    req = urllib.request.Request(url, headers=dict(UA))
+    if "api.github.com" in url:
+        req.add_header("Accept", "application/vnd.github+json")
+        if tok := (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
+            req.add_header("Authorization", f"Bearer {tok}")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read() if binary else r.read().decode("utf-8", "replace")
+
+
+def installed_version(pkg):
+    """Installed VERSION-RELEASE, or None."""
+    r = subprocess.run(["rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}", pkg],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def rpm_nevra(path):
+    """(name, version-release) from a local .rpm file."""
+    r = subprocess.run(
+        ["rpm", "-qp", "--nosignature", "--qf", "%{NAME}\n%{VERSION}-%{RELEASE}", str(path)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, None
+    parts = r.stdout.strip().split("\n")
+    return (parts[0], parts[1]) if len(parts) == 2 else (None, None)
+
+
+def newer(candidate, current):
+    """True if candidate > current, using rpm's own version ordering."""
+    if current is None:
+        return True
+    if candidate == current:
+        return False
+    r = subprocess.run(["rpmdev-vercmp", candidate, current],
+                       capture_output=True, text=True)
+    # rpmdev-vercmp: 0 = equal, 11 = first newer, 12 = second newer
+    if r.returncode in (0, 11, 12):
+        return r.returncode == 11
+    return candidate != current  # fall back: differing means worth offering
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(state, indent=2, sort_keys=True))
+    except OSError:
+        pass
+
+
+def head_info(url):
+    """(filename, etag) from a HEAD request. Either may be None.
+
+    Download endpoints often end in something like /linux/rpm/x64 with the real
+    filename only in Content-Disposition, so ask before fetching 90+ MB.
+    """
+    try:
+        req = urllib.request.Request(url, headers=dict(UA), method="HEAD")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            cd = r.headers.get("Content-Disposition", "") or ""
+            m = re.search(r'filename\*?=(?:"([^"]+)"|([^;]+))', cd)
+            fn = (m.group(1) or m.group(2)).strip() if m else None
+            return fn, r.headers.get("ETag")
+    except (urllib.error.URLError, ValueError, OSError):
+        return None, None
+
+
+LOOSE_VER_RE = re.compile(r"-v?(\d+(?:\.\d+)+)")
+
+
+FILENAME_RE = re.compile(
+    r"^(?P<name>.+)-(?P<ver>[^-]+)-(?P<rel>[^-]+)\.[A-Za-z0-9_]+\.rpm$")
+
+
+def version_from_filename(url):
+    """VERSION-RELEASE parsed from a conventional RPM filename, else None.
+
+    More trustworthy than a git tag: upstreams routinely mis-tag releases
+    (topcheer/sonos-controller's v0.2.1 tag ships a 0.2.0 RPM).
+    """
+    fn = url.rsplit("/", 1)[-1].split("?")[0]
+    m = FILENAME_RE.match(fn)
+    if m:
+        return f"{m.group('ver')}-{m.group('rel')}"
+    # Looser fallback for vendor filenames like "morgen-4.0.6x86_64.rpm"
+    # that omit the release field. Version only - no dash.
+    loose = LOOSE_VER_RE.search(fn)
+    return loose.group(1) if loose else None
+
+
+# --- source resolvers: each returns (download_url, version_hint or None) ---
+
+def resolve_github(cfg):
+    repo = cfg["repo"]
+    pattern = re.compile(cfg.get("asset", r"\.x86_64\.rpm$"))
+    data = fetch(f"https://api.github.com/repos/{repo}/releases/latest")
+    import json
+    rel = json.loads(data)
+    for asset in rel.get("assets", []):
+        if pattern.search(asset["name"]):
+            return asset["browser_download_url"], rel.get("tag_name", "").lstrip("v")
+    raise LookupError(f"no asset matching {pattern.pattern} in {repo} {rel.get('tag_name')}")
+
+
+def resolve_scrape(cfg):
+    """Find an RPM link on a web page - for vendors with no release API."""
+    page = fetch(cfg["url"])
+    pattern = re.compile(cfg.get("pattern", r'https?://[^\s"\'<>]+\.x86_64\.rpm'))
+    m = pattern.search(page)
+    if not m:
+        raise LookupError(f"no RPM link matching {pattern.pattern} at {cfg['url']}")
+    link = m.group(1) if m.groups() else m.group(0)
+    if not urlparse(link).scheme:  # relative of any shape -> absolute
+        link = urljoin(cfg["url"], link)
+    return link, None
+
+
+def resolve_direct(cfg):
+    return cfg["url"], None
+
+
+RESOLVERS = {"github": resolve_github, "scrape": resolve_scrape, "direct": resolve_direct}
+
+
+VERSION_IN_OUTPUT_RE = re.compile(r"\b(\d+(?:\.\d+)+)\b")
+
+
+def installed_binary_version(cfg, binary):
+    """Version reported by an already-installed binary, or None.
+
+    Defaults to `<binary> --version` and takes the first dotted number in the
+    output, which covers the overwhelming majority of CLIs. Override per source
+    with version_cmd = [...] and, if the output is awkward, version_re = '...'.
+    """
+    path = BIN_DIR / binary
+    if not path.exists():
+        return None
+    cmd = cfg.get("version_cmd") or [str(path), "--version"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout + r.stderr).strip()
+    pattern = re.compile(cfg["version_re"]) if cfg.get("version_re") else VERSION_IN_OUTPUT_RE
+    m = pattern.search(out)
+    return m.group(1) if m else None
+
+
+def process_binary(name, cfg, url, filename, etag, hint, check_only, state):
+    """Install/update a bare binary from a release asset."""
+    binary = cfg.get("binary", name)
+    current = installed_binary_version(cfg, binary)
+
+    # A binary asset is usually named for its platform, not its version
+    # (e.g. "dcli-linux-x64"), so the release tag is normally the only hint.
+    if not hint:
+        print(f"  {RED}{name}: no version could be determined for {filename}{RESET}")
+        return False
+
+    if current and not newer(hint, current):
+        print(f"  {name}: {DIM}up to date ({current}){RESET}")
+        state[name] = {"url": url, "etag": etag, "version": current}
+        return True
+
+    label = f"{current} -> {hint}" if current else f"not installed -> {hint}"
+    if check_only:
+        print(f"  {YELLOW}{name}: update available ({label}){RESET}")
+        return True
+
+    print(f"  {BOLD}{name}: installing {label}{RESET}")
+    CACHE.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE / f"{name}__{filename}"
+    try:
+        tmp.write_bytes(fetch(url, binary=True))
+    except (urllib.error.URLError, ValueError, OSError) as e:
+        print(f"  {RED}{name}: download failed: {e}{RESET}")
+        return False
+
+    if tmp.stat().st_size < 1024:
+        print(f"  {RED}{name}: downloaded file is implausibly small ({tmp.stat().st_size} B){RESET}")
+        tmp.unlink(missing_ok=True)
+        return False
+
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BIN_DIR / binary
+    try:
+        tmp.chmod(0o755)
+        os.replace(tmp, dest)          # atomic: never a half-written binary on PATH
+    except OSError as e:
+        print(f"  {RED}{name}: install failed: {e}{RESET}")
+        tmp.unlink(missing_ok=True)
+        return False
+
+    now = installed_binary_version(cfg, binary) or hint
+    state[name] = {"url": url, "etag": etag, "version": now}
+    print(f"  {GREEN}{name}: now {now}{RESET}  {DIM}({dest}){RESET}")
+    return True
+
+
+def process(name, cfg, check_only, state):
+    pkg = cfg.get("package", name)
+    kind = cfg.get("type", "github")
+    if kind not in RESOLVERS:
+        print(f"  {RED}{name}: unknown type '{kind}'{RESET}")
+        return False
+
+    current = installed_version(pkg)
+    try:
+        url, hint = RESOLVERS[kind](cfg)
+    except (urllib.error.URLError, LookupError, KeyError, ValueError, OSError) as e:
+        print(f"  {RED}{name}: {e}{RESET}")
+        return False
+
+    # Download endpoints often end in something like /linux/rpm/x64, with the
+    # real filename and an ETag only visible from a HEAD request.
+    filename, etag = head_info(url)
+    filename = filename or url.rsplit("/", 1)[-1].split("?")[0]
+    prev = state.get(name) or {}
+
+    def up_to_date():
+        print(f"  {name}: {DIM}up to date ({current}){RESET}")
+        state[name] = {"url": url, "etag": etag, "version": current}
+        return True
+
+    # Cheap path: the filename or tag already names the installed version.
+    hint = version_from_filename(filename) or version_from_filename(url) or hint
+
+    # Binary sources diverge here: no rpm to inspect, no dnf to install with.
+    if cfg.get("install", "rpm") == "binary":
+        return process_binary(name, cfg, url, filename, etag, hint, check_only, state)
+    if hint and current:
+        if (current == hint) if "-" in hint else (current.split("-")[0] == hint):
+            return up_to_date()
+
+    # Backstop for endpoints exposing no version at all: an unchanged ETag
+    # against the version we already hold means there is nothing new.
+    if etag and current and prev.get("etag") == etag and prev.get("version") == current:
+        return up_to_date()
+
+    CACHE.mkdir(parents=True, exist_ok=True)
+    dest = CACHE / f"{name}__{filename}"  # source-prefixed: two vendors can
+    try:                                  # both serve a file called "x64"
+        if not dest.exists():
+            dest.write_bytes(fetch(url, binary=True))
+    except (urllib.error.URLError, ValueError, OSError) as e:
+        print(f"  {RED}{name}: download failed: {e}{RESET}")
+        return False
+
+    rpm_name, candidate = rpm_nevra(dest)
+    if not candidate:
+        print(f"  {RED}{name}: not a readable RPM: {dest.name}{RESET}")
+        dest.unlink(missing_ok=True)
+        return False
+    if rpm_name and rpm_name != pkg:
+        pkg, current = rpm_name, installed_version(rpm_name)
+
+    if not newer(candidate, current):
+        return up_to_date()
+
+    label = f"{current} -> {candidate}" if current else f"not installed -> {candidate}"
+    if check_only:
+        print(f"  {YELLOW}{name}: update available ({label}){RESET}")
+        return True
+
+    print(f"  {BOLD}{name}: installing {label}{RESET}")
+    r = subprocess.run(["sudo", "dnf", "install", "-y", str(dest)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  {RED}{name}: dnf failed{RESET}")
+        print("    " + "\n    ".join(r.stderr.strip().splitlines()[-4:]))
+        return False
+    current = installed_version(pkg)
+    state[name] = {"url": url, "etag": etag, "version": current}
+    dest.unlink(missing_ok=True)  # installed; no reason to keep 90+ MB around
+    print(f"  {GREEN}{name}: now {current}{RESET}")
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Update RPMs and binaries published without a repo.")
+    ap.add_argument("names", nargs="*", help="only these sources (default: all)")
+    ap.add_argument("--check", action="store_true", help="report updates, install nothing")
+    args = ap.parse_args()
+
+    if not CONFIG.exists():
+        print(f"No config at {CONFIG}", file=sys.stderr)
+        return 1
+    sources = tomllib.loads(CONFIG.read_text())
+    if args.names:
+        sources = {k: v for k, v in sources.items() if k in args.names}
+        for missing in set(args.names) - set(sources):
+            print(f"  {RED}{missing}: not in config{RESET}")
+    if not sources:
+        print("No sources configured.")
+        return 0
+
+    print(f"{BOLD}Out-of-band packages and binaries{RESET}")
+    state = load_state()
+    ok = all([process(n, c, args.check, state) for n, c in sorted(sources.items())])
+    save_state(state)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

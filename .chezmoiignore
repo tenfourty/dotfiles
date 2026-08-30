@@ -1,0 +1,19 @@
+# Owned by ~/dev/bootstrap.sh, which derives the machine dir from hostname.
+# chezmoi must not manage it — the hostname logic lives with whatever owns the
+# docs layout, not duplicated in a chezmoi template.
+.bashrc.d/50-machine-docs.sh
+
+# Symlinks into ~/dev, which is Nextcloud-synced content, not dotfiles.
+# Two systems claiming the same targets is the failure mode to avoid.
+AGENTS.md
+docs
+me
+
+# Secrets and machine-local state that must never enter the repo, encrypted
+# or otherwise.
+.config/chezmoi/key.txt
+.config/atuin/key
+.local/share/atuin
+.claude/.credentials.json
+.config/1Password
+.ssh/known_hosts*

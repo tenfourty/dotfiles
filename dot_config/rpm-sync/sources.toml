@@ -1,0 +1,67 @@
+# Sources for `rpm-sync` - projects that publish an .rpm per release but run no
+# dnf repository, so `dnf upgrade` can never see their updates.
+#
+# Each section is one package. Keys:
+#   type    = "github" | "scrape" | "direct"   (default: github)
+#   package = installed RPM name, if it differs from the section name
+#
+# type = "github"  -> reads the repo's latest release
+#   repo  = "owner/name"
+#   asset = regex picking the right asset  (default: '\.x86_64\.rpm$')
+#
+# type = "scrape"  -> for vendors with only a download page
+#   url     = page to fetch
+#   pattern = regex for the RPM link; if it has a capture group, group 1 is used
+#
+# type = "direct"  -> a URL that always points at the current RPM
+#   url = "https://example.com/latest/app.x86_64.rpm"
+
+[sonos-controller]
+# The CURRENT Sonos controller. Briefly removed in error on 2026-08-30 and
+# restored the same day: the genuinely old copy is the 2021 AppImage
+# (sonos-controller-unofficial-0.2.6) in ~/LinuxApplications, not this rpm.
+type = "github"
+repo = "topcheer/sonos-controller"
+asset = '\.x86_64\.rpm$'
+
+# --- examples, uncomment and adapt ---------------------------------------
+#
+# [someapp]
+# type = "scrape"
+# url = "https://example.com/download/linux"
+# pattern = 'href="(https://[^"]+\.x86_64\.rpm)"'
+#
+# [otherapp]
+# type = "direct"
+# url = "https://example.com/dist/otherapp-latest.x86_64.rpm"
+# package = "otherapp-desktop"
+
+[morgen]
+# The download page links a *stable* todesktop URL (no build id) that redirects
+# to the current build, so scraping it survives both new releases and a change
+# of todesktop app id. Equivalent direct form, if the page layout ever breaks:
+#   type = "direct"
+#   url  = "https://dl.todesktop.com/210203cqcj00tw1/linux/rpm/x64"
+type = "scrape"
+url = "https://platform.morgen.so/download"
+pattern = 'https://dl\.todesktop\.com/[A-Za-z0-9]+/linux/rpm/x64'
+
+# --- binary sources (install = "binary") ---------------------------------
+# For upstreams that attach a bare executable to a release rather than a
+# package. The asset is chmod +x'd and placed in ~/.local/bin.
+#   binary      = name to install as        (default: section name)
+#   version_cmd = how to ask the installed copy its version
+#                 (default: ["<binary>", "--version"])
+#   version_re  = regex with one capture group, if the output is awkward
+
+[dcli]
+# Dashlane CLI. Used by chezmoi/age workflows for secrets. Dashlane publish no
+# rpm and no repo -- only bare per-platform binaries on each GitHub release.
+# Their docs warn against the npm install on personal machines ("the NodeJS
+# process will be the owner of your secrets"), so the packaged binary is the
+# recommended route anyway.
+type = "github"
+repo = "Dashlane/dashlane-cli"
+asset = '^dcli-linux-x64$'
+install = "binary"
+binary = "dcli"

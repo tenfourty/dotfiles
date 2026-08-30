@@ -1,0 +1,36 @@
+# Starship configuration
+# https://starship.rs/config/
+#
+# The default prompt is used for interactive shells (see ~/.bashrc.d/starship.sh).
+# The [profiles] section below defines an alternate, single-line format used by
+# the Claude Code status line (~/.claude/statusline.sh), so the two can evolve
+# independently without one breaking the other.
+
+add_newline = true
+
+[profiles]
+claude = "$directory$git_branch$git_state$git_status$nodejs$python$rust$java$golang"
+
+[directory]
+truncation_length = 3
+truncate_to_repo = true
+style = "bold cyan"
+
+[git_branch]
+symbol = " "
+style = "bold purple"
+
+[git_status]
+style = "bold yellow"
+
+[nodejs]
+format = "[$symbol($version )]($style)"
+style = "bold green"
+
+[python]
+format = "[$symbol($version )]($style)"
+style = "bold yellow"
+
+[rust]
+format = "[$symbol($version )]($style)"
+style = "bold red"

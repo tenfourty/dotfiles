@@ -1,0 +1,38 @@
+# ~/.config/ghostty/config.ghostty
+# Fedora 44 / KDE Plasma 6.7 Wayland
+
+# --- Window chrome -------------------------------------------------
+# On non-GNOME desktops `auto` picks server-side decorations, which means
+# KWin draws the titlebar and the libadwaita headerbar never renders --
+# taking the hamburger menu and the tab bar with it. Force client-side.
+window-decoration = client
+gtk-titlebar-style = tabs
+gtk-tabs-location = top
+
+# --- Font ----------------------------------------------------------
+# Nerd Font required for Starship's default prompt glyphs (powerline
+# separators, git symbols). The "Mono" variant constrains glyphs to a single
+# cell, which keeps terminal grid alignment correct.
+# Installed to ~/.local/share/fonts/FiraCodeNerdFont (not packaged in Fedora).
+font-family = FiraCode Nerd Font Mono
+
+# --- Keybindings ---------------------------------------------------
+# Deliberately left at Ghostty's defaults (ctrl+shift+*).
+# Toshy handles the Mac-style translation: it shifts the physical Alt key
+# (next to the spacebar) to act as Cmd, then maps Cmd+* onto Ghostty's
+# native ctrl+shift+* bindings. See "Ghostty terminal overrides" in
+# toshy_config.py -- e.g. Cmd+D -> ctrl+shift+O (split right).
+# Adding super+* bindings here would be dead weight: Ghostty never
+# receives Super once Toshy has remapped the modifier positions.
+
+# --- Global show/hide hotkey ------------------------------------------------
+# Handled OUTSIDE Ghostty, by ~/.local/bin/ghostty-toggle bound to Ctrl+/ as a
+# KDE global shortcut.
+#
+# Why not a Ghostty `global:` keybind? The mechanism works fine -- Ghostty
+# receives every press via the GlobalShortcuts portal -- but neither candidate
+# action is usable here:
+#   toggle_visibility     -> "unimplemented action" on the GTK backend (macOS only)
+#   toggle_quick_terminal -> works, but is a gtk4-layer-shell surface, not the
+#                            real window, and mis-sized itself on KWin 6.7.4
+# kdotool drives KWin directly instead, which raises the actual window.

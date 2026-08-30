@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Focus Ghostty, switching to whichever desktop it lives on.
+#
+# The same thing is registered directly with KWin as Ctrl+/ via:
+#   kdotool --shortcut "Ctrl+/" --name ghostty-toggle \
+#           search --class com.mitchellh.ghostty windowactivate
+# This script exists for manual use and as documentation of that binding.
+#
+# Ghostty's own `global:` keybinds are NOT usable for this: toggle_visibility
+# is unimplemented on the GTK backend, and toggle_quick_terminal opens a
+# gtk4-layer-shell surface rather than the real window.
+set -uo pipefail
+CLASS=com.mitchellh.ghostty
+if kdotool search --class "$CLASS" 2>/dev/null | grep -q .; then
+    kdotool search --class "$CLASS" windowactivate
+else
+    setsid ghostty >/dev/null 2>&1 < /dev/null &
+fi
