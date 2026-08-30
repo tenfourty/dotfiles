@@ -1,0 +1,2 @@
+# ggshield writes a scan cache here; not part of the dotfiles.
+.cache_ggshield
