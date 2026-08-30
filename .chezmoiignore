@@ -17,3 +17,9 @@ me
 .claude/.credentials.json
 .config/1Password
 .ssh/known_hosts*
+
+# SSH private keys must never enter the repo, encrypted or otherwise. The
+# public key and config are fine and are managed; the private half is not.
+.ssh/id_*
+!.ssh/id_*.pub
+.ssh/cm-*
