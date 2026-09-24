@@ -6,6 +6,9 @@
 # is NOT in this repo: restore it from the Dashlane secure note
 # "chezmoi dotfiles - age identity" before running chezmoi init.
 
+# Record where this machine's source lives, so plain `chezmoi` finds it when the
+# clone is not at the default ~/.local/share/chezmoi (the Mac keeps it in ~/repos).
+sourceDir = {{ .chezmoi.sourceDir | quote }}
 encryption = "age"
 
 [age]
