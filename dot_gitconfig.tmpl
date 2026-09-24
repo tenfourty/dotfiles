@@ -1,3 +1,18 @@
+{{- if eq .chezmoi.os "darwin" -}}
+# macOS (work laptop). Machine-specific blocks live in age-encrypted includes so
+# the public repo carries neither the work identity nor the forge hostnames:
+#   ~/.config/git/work-gg.inc  GitGuardian identity, signing, gh credential helper
+#   ~/.config/git/forge.inc    personal forge credentials + per-remote identity switch
+# Include order is load-bearing: forge.inc's includeIfs must come after work-gg.inc
+# so forge remotes override the work identity, and hooksPath stays last.
+[user]
+	name = Jeremy Brown
+[include]
+	path = ~/.config/git/work-gg.inc
+	path = ~/.config/git/forge.inc
+[core]
+	hooksPath = {{ .chezmoi.homeDir }}/Library/Application Support/ggshield/git-hooks
+{{- else -}}
 [user]
 	name = Jeremy Brown
 	email = jeremy@tenfourty.com
@@ -38,3 +53,4 @@
 	dc = diff --cached
 	l = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit
 	s = status
+{{- end }}

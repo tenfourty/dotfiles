@@ -86,6 +86,23 @@ Honest limits — these need doing by hand on a fresh machine:
 - **Application state and credentials** — browser profiles, Slack, Beeper.
 - **Data.** This repo is config only.
 
+## macOS
+
+The work MacBook uses the same repo, OS-gated. `.chezmoiignore`'s darwin block
+skips everything Linux-only, the provisioning scripts, `.ssh`, and the files not
+yet reconciled with the Mac's own versions — adoption is one line at a time, so
+an apply never rewrites something the Mac already has. `.gitconfig` is a template:
+on darwin it only carries the name, the ggshield `hooksPath`, and two
+age-encrypted includes, `~/.config/git/work-gg.inc` (work identity, signing, gh
+helper) and `~/.config/git/forge.inc` (forge credentials, per-remote identity).
+Without the age identity those two are skipped rather than failing the apply.
+
+```sh
+brew install chezmoi age git-delta
+chezmoi init --source ~/repos/dotfiles     # clone lives with the other repos
+chezmoi status                             # must be empty before trusting an apply
+```
+
 ## Not managed here
 
 - `~/.bashrc.d/50-machine-docs.sh` — written by `~/dev/bootstrap.sh`

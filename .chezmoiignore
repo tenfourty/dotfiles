@@ -31,3 +31,50 @@ README.md
 # Copies of /etc/yum.repos.d files, consumed by run_onchange_10-repos.sh.
 # Not dotfiles; must never be written into $HOME.
 etc-repos
+
+{{- if eq .chezmoi.os "darwin" }}
+# macOS: adopt gradually. The first apply must change nothing that already
+# exists on the Mac, so everything below is either Linux-only or not yet merged
+# with the Mac's own version. Remove a line once its file is reconciled.
+
+# Linux-only: KDE/KWin, toshy, dnf tooling, bash (the Mac runs zsh).
+.config/kwinrulesrc
+.local/share/kwin
+.config/toshy
+.config/rpm-sync
+.local/bin/rpm-sync
+.local/bin/machine-manifest
+.local/bin/ghostty-toggle
+.config/ghostty
+.bash_profile
+.bashrc
+.bashrc.d
+.inputrc
+.gitignore
+
+# Provisioning scripts are dnf/flatpak/Fedora-shaped; 40-user-tools would run
+# cargo binstall / uv tool install here, since both exist on the Mac.
+10-repos.sh
+20-packages.sh
+30-flatpak.sh
+40-user-tools.sh
+
+# Per-machine: this Mac's SSH uses Secretive + owl (see ~/docs/ssh-agent-setup.md),
+# and its public key is not the xps13's.
+.ssh
+
+# Not yet reconciled with the Mac's live versions.
+.claude/settings.json
+.claude/statusline.sh
+.claude/hooks/herdr-agent-state.sh
+.config/atuin
+.config/starship.toml
+.config/topgrade.toml
+{{- end }}
+
+{{- if not (stat (joinPath .chezmoi.homeDir ".config/chezmoi/key.txt")) }}
+# No age identity restored on this machine yet: skip the encrypted git includes
+# rather than failing the whole apply. Restore the key (see README) to manage them.
+.config/git/work-gg.inc
+.config/git/forge.inc
+{{- end }}
