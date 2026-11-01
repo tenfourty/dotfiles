@@ -26,8 +26,13 @@ KEEP = 96
 REX = shutil.which("rex") or os.path.expanduser("~/.local/bin/rex")
 SSH = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 SHELLS = ("zsh", "bash", "sh", "fish")
-# Claude options worth carrying over. Anything else, such as a prompt, must not be replayed.
-KEEP_FLAGS = {"--chrome": 0, "--dangerously-skip-permissions": 0, "--model": 1, "--permission-mode": 1}
+# Claude options worth carrying over, with how many values each takes. Anything else, such as a
+# prompt, must not be replayed. Permission options come back only with restore --keep-permissions.
+KEEP_FLAGS = {"--chrome": 0, "--model": 1}
+PERMISSION_FLAGS = {"--dangerously-skip-permissions": 0, "--permission-mode": 1}
+SAFE_VALUE = re.compile(r"[A-Za-z0-9._:\[\]-]+")
+SAFE_ID = re.compile(r"[A-Za-z0-9_:-]+")
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # Runs on the host: live Claude sessions by process, and the command line of each process asked for.
 PROBE = r"""
@@ -99,7 +104,8 @@ def blocks_of(view):
     for w in view.get("windows", []):
         for layer in w.get("layers", []):
             for b in layer.get("blocks", []):
-                if "terminal" in b.get("flavor", ""):
+                # IDs come from the server, which may be remote, and name files on this Mac.
+                if "terminal" in b.get("flavor", "") and SAFE_ID.fullmatch(str(b.get("block_id"))):
                     yield w, b
 
 
@@ -108,6 +114,8 @@ def backup_host(host, folder):
     sessions, panes = [], []
     os.makedirs(os.path.join(folder, "scrollback"))
     for s in rex_json(host, "ls", "--json")["sessions"]:
+        if not SAFE_ID.fullmatch(str(s.get("session_id"))):
+            continue
         view = rex_json(host, "api", "call", "-s", s["session_id"], "session.view")
         sessions.append(view)
         for w, b in blocks_of(view):
@@ -206,12 +214,32 @@ def choose(host, instance, stamp):
     return None, None
 
 
-def resume_command(c, fallback_cwd):
-    words, flags = shlex.split(c["args"]), []
-    for i, w in enumerate(words):
-        if w in KEEP_FLAGS:
-            flags += words[i:i + 1 + KEEP_FLAGS[w]]
-    parts = ["claude", "--resume", c["conversation"], *flags]
+def resume_flags(args, keep_permissions):
+    """Options from a flattened command line. Stops at anything not understood: it may be a prompt."""
+    try:
+        words = shlex.split(args)
+    except ValueError:
+        return []
+    known = {**KEEP_FLAGS, **PERMISSION_FLAGS}
+    flags, i = [], 1
+    while i < len(words):
+        w = words[i]
+        if w in ("--resume", "-r"):
+            i += 2
+        elif w in known:
+            values = words[i + 1:i + 1 + known[w]]
+            if len(values) != known[w] or not all(SAFE_VALUE.fullmatch(v) for v in values):
+                break
+            if w in KEEP_FLAGS or keep_permissions:
+                flags += [w, *values]
+            i += 1 + known[w]
+        else:
+            break
+    return flags
+
+
+def resume_command(c, fallback_cwd, keep_permissions=False):
+    parts = ["claude", "--resume", c["conversation"], *resume_flags(c["args"], keep_permissions)]
     cwd = c.get("cwd") or fallback_cwd
     return (f"cd {shlex.quote(cwd)} && " if cwd else "") + " ".join(shlex.quote(p) for p in parts)
 
@@ -234,10 +262,15 @@ def restore_host(host, args):
         if not x["claude"]:
             continue
         c, session_id, block = x["claude"], x["session_id"], x["block"]
-        command = resume_command(c, x.get("cwd"))
+        command = resume_command(c, x.get("cwd"), args.keep_permissions)
         if not re.fullmatch(r"[A-Za-z0-9_.:-]+", c["conversation"]):
             problems += 1
             print(f"  unexpected conversation ID, left alone: {where}")
+            continue
+        # Quoting doesn't stop a typed Return from running the line, so nothing with control characters is typed.
+        if CONTROL.search(command) or not SAFE_ID.fullmatch(str(session_id)) or not SAFE_ID.fullmatch(str(block)):
+            problems += 1
+            print(f"  unsafe characters in the saved details, left alone: {where}")
             continue
         if c["conversation"] in running:
             print(f"  already running: {where}")
@@ -311,6 +344,7 @@ def main():
     r.add_argument("--host", choices=list(HOSTS), help="only this host")
     r.add_argument("--session", help="only this Rex session, by name")
     r.add_argument("--stamp", help="use this backup, as shown by list")
+    r.add_argument("--keep-permissions", action="store_true", help="also restore permission options the conversation was started with")
     args = ap.parse_args()
     sys.exit({"list": cmd_list, "restore": cmd_restore}.get(args.command, cmd_backup)(args))
 
