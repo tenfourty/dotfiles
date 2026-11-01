@@ -78,3 +78,12 @@ etc-repos
 .config/git/work-gg.inc
 .config/git/forge.inc
 {{- end }}
+
+{{- if ne .chezmoi.os "darwin" }}
+# Rex client setup for the Mac: its launchd jobs, tunnels and clipboard action are Mac-only.
+.config/rex
+.local/bin/rex-backup
+.local/bin/rex-waiting
+.local/state/rex-tunnels
+Library
+{{- end }}

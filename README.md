@@ -109,6 +109,17 @@ chezmoi status                             # must be empty before trusting an ap
 - `~/AGENTS.md`, `~/docs`, `~/me` — symlinks into Nextcloud-synced `~/dev`
 - SSH private keys, the age identity, atuin's key and database
 
+## Rex on the Mac
+
+`chezmoi apply` writes the launchd jobs but doesn't load them. On a new Mac, load each with
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<job>.plist`: `dev.rex-backup` and the
+`dev.rex-tunnel.*` jobs. The tunnels also need the `*-herdr` SSH aliases and keys, which aren't
+managed here, and a Rex server on each host. Add each tunnel's socket in the Rex app with
+Add Remote Host, as `unix://$HOME/.local/state/rex-tunnels/<host>.sock`.
+
+`dot_config/rex/rex-image-paste` is a copy of github.com/pablasso/rex-image-paste at 1d883ef with
+one local change, so read upstream's diff before updating it.
+
 ## Verifying before a push
 
 ```sh

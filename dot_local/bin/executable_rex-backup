@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Back up Rex sessions on this Mac and its remote hosts, and reopen Claude after a restart.
+
+Rex brings back sessions, tabs, splits and pane IDs after a server restart, but each pane
+returns as a new shell. This records which Claude conversation ran in which pane, so they
+can be reopened.
+
+  rex-backup                     save a backup of every reachable host
+  rex-backup list                show the saved backups
+  rex-backup restore             preview what would be reopened
+  rex-backup restore --apply     reopen them
+
+Restore uses the newest backup from before the current server started. A conversation is
+reopened only if it isn't already running and its pane is sitting at an idle shell. It then
+waits for input: unfinished work doesn't continue by itself.
+
+Backups hold terminal scrollback, which can include secrets: they're in a private folder
+(mode 0700) and must not go anywhere that syncs.
+"""
+import argparse, datetime, gzip, json, os, re, shlex, shutil, subprocess, sys, time
+
+# Rex host label -> SSH alias for reading Claude's session records. None is this Mac.
+HOSTS = {"local": None, "baba": "baba-herdr", "bifrost": "bifrost-herdr", "jbrown-dev": "jbrown-dev-herdr"}
+ROOT = os.path.expanduser("~/.local/state/rex-backup")
+KEEP = 96
+REX = shutil.which("rex") or os.path.expanduser("~/.local/bin/rex")
+SSH = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+SHELLS = ("zsh", "bash", "sh", "fish")
+# Claude options worth carrying over. Anything else, such as a prompt, must not be replayed.
+KEEP_FLAGS = {"--chrome": 0, "--dangerously-skip-permissions": 0, "--model": 1, "--permission-mode": 1}
+
+# Runs on the host: live Claude sessions by process, and the command line of each process asked for.
+PROBE = r"""
+import glob, json, os, subprocess, sys
+args = {}
+for line in subprocess.run(["ps", "axww", "-o", "pid=,args="], capture_output=True, text=True, errors="replace").stdout.splitlines():
+    p = line.split(None, 1)
+    if len(p) == 2:
+        args[p[0]] = p[1]
+claude = {}
+for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+    try:
+        d = json.load(open(f))
+        os.kill(int(d["pid"]), 0)
+    except (OSError, ValueError, KeyError, TypeError):
+        continue
+    if d.get("sessionId"):
+        claude[str(d["pid"])] = {"conversation": d["sessionId"], "cwd": d.get("cwd"), "args": args.get(str(d["pid"]), "")}
+print(json.dumps({"claude": claude, "args": {p: args.get(p, "") for p in sys.argv[1:]}}))
+"""
+
+
+def run(*a, timeout=60, input=None):
+    return subprocess.run(a, capture_output=True, text=True, errors="replace", timeout=timeout, input=input,
+                          stdin=None if input is not None else subprocess.DEVNULL)
+
+
+def rex(host, *a, timeout=60):
+    return run(REX, *([] if host == "local" else ["-S", host]), *a, timeout=timeout)
+
+
+def rex_json(host, *a):
+    p = rex(host, *a)
+    if p.returncode:
+        raise RuntimeError((p.stderr or p.stdout).strip()[:200])
+    return json.loads(p.stdout)
+
+
+def probe(host, pids=()):
+    pids = [str(p) for p in pids]
+    alias = HOSTS[host]
+    if alias:
+        p = run(*SSH, alias, "python3 - " + " ".join(pids), input=PROBE)
+    else:
+        p = run("python3", "-", *pids, input=PROBE)
+    if p.returncode:
+        raise RuntimeError((p.stderr or p.stdout).strip()[-200:])
+    return json.loads(p.stdout)
+
+
+def foreground(host, session_id, block):
+    return rex_json(host, "block", "call", "process", "-s", session_id, "-b", block).get("foreground") or {}
+
+
+def is_shell(fg):
+    return (fg.get("argv0") or fg.get("name") or "").lstrip("-").rsplit("/", 1)[-1] in SHELLS
+
+
+def at_prompt(host, session_id, block):
+    """The pane's login shell is in front and its line editor is reading input."""
+    process = rex_json(host, "block", "call", "process", "-s", session_id, "-b", block)
+    fg = process.get("foreground") or {}
+    if process.get("last_exit") is not None or not (fg.get("argv0") or "").startswith("-") or len(process.get("ancestors") or []) > 1:
+        return False
+    return rex_json(host, "block", "call", "input_mode", "-s", session_id, "-b", block).get("canonical") is False
+
+
+def blocks_of(view):
+    for w in view.get("windows", []):
+        for layer in w.get("layers", []):
+            for b in layer.get("blocks", []):
+                if "terminal" in b.get("flavor", ""):
+                    yield w, b
+
+
+def backup_host(host, folder):
+    status = rex_json(host, "api", "call", "server.status")
+    sessions, panes = [], []
+    os.makedirs(os.path.join(folder, "scrollback"))
+    for s in rex_json(host, "ls", "--json")["sessions"]:
+        view = rex_json(host, "api", "call", "-s", s["session_id"], "session.view")
+        sessions.append(view)
+        for w, b in blocks_of(view):
+            block = b["block_id"]
+            fg = foreground(host, s["session_id"], block)
+            states = rex_json(host, "block", "call", "program_status", "-s", s["session_id"], "-b", block).get("records") or []
+            panes.append({"session_id": s["session_id"], "session": s.get("label"), "tab": w.get("label"), "block": block,
+                          "pid": fg.get("pid"), "program": fg.get("name"), "shell": is_shell(fg), "cwd": fg.get("cwd"),
+                          "state": states[0].get("state") if states else None})
+            p = rex(host, "capture", "-s", s["session_id"], "-b", block, "--trim", "--unwrap", timeout=120)
+            if p.returncode == 0:
+                with gzip.open(os.path.join(folder, "scrollback", block.replace(":", "_") + ".txt.gz"), "wt") as f:
+                    f.write(p.stdout)
+    # No panes, no SSH login: scheduled runs shouldn't log in through Warpgate for nothing.
+    live = probe(host, [x["pid"] for x in panes if x["pid"] and not x["shell"]]) if panes else {}
+    agents = 0
+    for x in panes:
+        pid = str(x.pop("pid"))
+        x["claude"] = live["claude"].get(pid)
+        agents += bool(x["claude"])
+        if not x["shell"] and not x["claude"]:
+            x["command"] = live["args"].get(pid, "")
+    manifest = {"host": host, "taken_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+                "server_started": status["started_at"], "server_instance": status["instance_id"],
+                "sessions": sessions, "panes": panes}
+    with open(os.path.join(folder, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+    return len(sessions), len(panes), agents
+
+
+def stamps():
+    if not os.path.isdir(ROOT):
+        return []
+    return sorted(d for d in os.listdir(ROOT) if re.fullmatch(r"\d{8}-\d{6}", d))
+
+
+def load(path):
+    with open(path) as f:
+        m = json.load(f)
+    m.setdefault("panes", [])  # backups from the first draft of this script had none
+    return m
+
+
+def prune():
+    """Keep the newest backups, and the last one with Claude in it from each server run."""
+    protected = {}
+    for s in stamps():
+        for host in HOSTS:
+            path = os.path.join(ROOT, s, host, "manifest.json")
+            if os.path.exists(path):
+                m = load(path)
+                if any(x["claude"] for x in m["panes"]):
+                    protected[host, m["server_instance"]] = s
+    for old in stamps()[:-KEEP]:
+        if old not in protected.values():
+            shutil.rmtree(os.path.join(ROOT, old))
+
+
+def cmd_backup(args):
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    tmp = os.path.join(ROOT, "." + stamp)
+    os.makedirs(tmp)
+    failed = 0
+    for host in HOSTS:
+        try:
+            n, panes, agents = backup_host(host, os.path.join(tmp, host))
+            print(f"{host}: {n} sessions, {panes} panes, {agents} Claude conversations")
+        except Exception as e:
+            failed += 1
+            shutil.rmtree(os.path.join(tmp, host), ignore_errors=True)
+            print(f"{host}: NOT backed up: {e}", file=sys.stderr)
+    os.rename(tmp, os.path.join(ROOT, stamp))
+    prune()
+    print("saved", os.path.join(ROOT, stamp))
+    return 1 if failed else 0
+
+
+def cmd_list(args):
+    for s in stamps():
+        row = []
+        for host in HOSTS:
+            path = os.path.join(ROOT, s, host, "manifest.json")
+            row.append(f"{host}:{sum(bool(x['claude']) for x in load(path)['panes'])}" if os.path.exists(path) else f"{host}:-")
+        print(s, " ".join(row))
+    return 0
+
+
+def choose(host, instance, stamp):
+    """Newest backup with Claude in it from before this server started, or the one asked for."""
+    for s in ([stamp] if stamp else reversed(stamps())):
+        path = os.path.join(ROOT, s, host, "manifest.json")
+        if os.path.exists(path):
+            m = load(path)
+            if stamp or (m["server_instance"] != instance and any(x["claude"] for x in m["panes"])):
+                return s, m
+    return None, None
+
+
+def resume_command(c, fallback_cwd):
+    words, flags = shlex.split(c["args"]), []
+    for i, w in enumerate(words):
+        if w in KEEP_FLAGS:
+            flags += words[i:i + 1 + KEEP_FLAGS[w]]
+    parts = ["claude", "--resume", c["conversation"], *flags]
+    cwd = c.get("cwd") or fallback_cwd
+    return (f"cd {shlex.quote(cwd)} && " if cwd else "") + " ".join(shlex.quote(p) for p in parts)
+
+
+def restore_host(host, args):
+    instance = rex_json(host, "api", "call", "server.status")["instance_id"]
+    stamp, m = choose(host, instance, args.stamp)
+    if not m:
+        print(f"{host}: no backup from before this server started, so nothing to reopen")
+        return 0
+    print(f"{host}: using the backup from {m['taken_at']} ({stamp})")
+    running = {c["conversation"] for c in probe(host)["claude"].values()}
+    problems, sent = 0, []
+    for x in m["panes"]:
+        if args.session and x["session"] != args.session:
+            continue
+        where = f"{x['session']} / {x['tab']}"
+        if x.get("command"):
+            print(f"  was running, restart by hand: {where}: {x['command'][:100]}")
+        if not x["claude"]:
+            continue
+        c, session_id, block = x["claude"], x["session_id"], x["block"]
+        command = resume_command(c, x.get("cwd"))
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", c["conversation"]):
+            problems += 1
+            print(f"  unexpected conversation ID, left alone: {where}")
+            continue
+        if c["conversation"] in running:
+            print(f"  already running: {where}")
+            continue
+        exists = rex(host, "block", "ls", "-s", session_id, "-q", "--short=false")
+        if exists.returncode or block not in exists.stdout.split():
+            problems += 1
+            print(f"  pane gone, run by hand: {where}\n    {command}")
+            continue
+        fg = foreground(host, session_id, block)
+        if not is_shell(fg):
+            problems += 1
+            print(f"  pane is running {fg.get('name') or 'nothing yet'}, left alone: {where}\n    {command}")
+            continue
+        note = " (it was mid-task, so tell it to carry on)" if x.get("state") not in (None, "idle") else ""
+        if not args.apply:
+            print(f"  would reopen: {where}{note}\n    {command}")
+            continue
+        ready_by = time.time() + 30
+        while not at_prompt(host, session_id, block) and time.time() < ready_by:
+            time.sleep(1)
+        if not at_prompt(host, session_id, block):
+            problems += 1
+            print(f"  shell not ready after 30 seconds, left alone: {where}\n    {command}")
+            continue
+        # Clears the line first, and the leading space keeps it out of a history that skips such lines.
+        typed = rex(host, "block", "call", "write", json.dumps({"data": f"\x05\x15 {command}\r"}), "-s", session_id, "-b", block)
+        if typed.returncode:
+            problems += 1
+            print(f"  FAILED to send: {where}: {typed.stderr.strip()[:200]}")
+            continue
+        running.add(c["conversation"])
+        print(f"  reopening: {where}{note}")
+        sent.append((c["conversation"], where))
+    end = time.time() + 90
+    while sent and time.time() < end:
+        time.sleep(3)
+        now = {c["conversation"] for c in probe(host)["claude"].values()}
+        for item in [i for i in sent if i[0] in now]:
+            print(f"  running again: {item[1]}")
+            sent.remove(item)
+    for _, where in sent:
+        problems += 1
+        print(f"  NOT confirmed running after 90 seconds: {where}")
+    return problems
+
+
+def cmd_restore(args):
+    problems = 0
+    for host in ([args.host] if args.host else HOSTS):
+        try:
+            problems += restore_host(host, args)
+        except Exception as e:
+            problems += 1
+            print(f"{host}: couldn't check: {e}", file=sys.stderr)
+    if not args.apply:
+        print("Preview only. Add --apply to reopen them.")
+    return 1 if problems else 0
+
+
+def main():
+    os.umask(0o077)
+    os.makedirs(ROOT, mode=0o700, exist_ok=True)
+    os.chmod(ROOT, 0o700)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="command")
+    sub.add_parser("backup", help="save a backup (the default)")
+    sub.add_parser("list", help="show the saved backups and their Claude counts")
+    r = sub.add_parser("restore", help="reopen Claude conversations after a restart")
+    r.add_argument("--apply", action="store_true", help="reopen them, rather than previewing")
+    r.add_argument("--host", choices=list(HOSTS), help="only this host")
+    r.add_argument("--session", help="only this Rex session, by name")
+    r.add_argument("--stamp", help="use this backup, as shown by list")
+    args = ap.parse_args()
+    sys.exit({"list": cmd_list, "restore": cmd_restore}.get(args.command, cmd_backup)(args))
+
+
+if __name__ == "__main__":
+    main()
