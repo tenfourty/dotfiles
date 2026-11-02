@@ -230,7 +230,8 @@ def resume_flags(args, keep_permissions):
             values = words[i + 1:i + 1 + known[w]]
             if len(values) != known[w] or not all(SAFE_VALUE.fullmatch(v) for v in values):
                 break
-            if w in KEEP_FLAGS or keep_permissions:
+            # A stricter mode is always kept: dropping it could reopen the conversation in a looser one.
+            if w in KEEP_FLAGS or keep_permissions or (w == "--permission-mode" and values[0] in ("auto", "default", "plan", "acceptEdits")):
                 flags += [w, *values]
             i += 1 + known[w]
         else:
