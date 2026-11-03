@@ -10,6 +10,11 @@ can be reopened.
   rex-backup restore             preview what would be reopened
   rex-backup restore --apply     reopen them
   rex-backup watch               reopen them by itself when a server has restarted (run by launchd)
+  rex-backup listen              follow every server's events: a quick backup when Claude, btop or
+                                 cswap starts or stops or a tab closes, and a reopen after a restart
+
+A host whose backups fail twice in a row gets a Mac notification, and another when it recovers.
+quarterdeck offices are never reopened: their bells restart them.
 
 Restore uses the newest backup from before the current server started. A conversation is
 reopened only if it isn't already running and its pane is sitting at an idle shell. It then
@@ -18,12 +23,13 @@ waits for input: unfinished work doesn't continue by itself.
 Backups hold terminal scrollback, which can include secrets: they're in a private folder
 (mode 0700) and must not go anywhere that syncs.
 """
-import argparse, datetime, gzip, json, os, re, shlex, shutil, subprocess, sys, time
+import argparse, contextlib, datetime, fcntl, gzip, json, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
 
 # Rex host label -> SSH alias for reading Claude's session records. None is this Mac.
 HOSTS = {"local": None, "baba": "baba-herdr", "bifrost": "bifrost-herdr", "jbrown-dev": "jbrown-dev-herdr"}
 ROOT = os.path.expanduser("~/.local/state/rex-backup")
-KEEP = 96
+# The listener adds small backups between the scheduled ones, so this is a few days' worth.
+KEEP = 300
 REX = shutil.which("rex") or os.path.expanduser("~/.local/bin/rex")
 SSH = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 SHELLS = ("zsh", "bash", "sh", "fish")
@@ -32,6 +38,10 @@ SHELLS = ("zsh", "bash", "sh", "fish")
 PROGRAMS = ("btop", "cswap")
 WATCH_STATE = os.path.join(ROOT, ".server-instances.json")
 WATCH_MAX_AGE_HOURS = 24
+FAILURES = os.path.join(ROOT, ".failures.json")
+ALERT_AFTER = 2
+# The listener backs a host up this long after the first change it sees, and no more often than MIN_GAP.
+DEBOUNCE, MIN_GAP = 30, 120
 # Claude options worth carrying over, with how many values each takes. Anything else, such as a
 # prompt, must not be replayed. Permission options come back only with restore --keep-permissions.
 KEEP_FLAGS = {"--chrome": 0, "--model": 1}
@@ -60,6 +70,47 @@ for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
 cswap = any(w == "cswap" or w.endswith("/cswap") for a in args.values() for w in a.split()[:2])
 print(json.dumps({"claude": claude, "args": {p: args.get(p, "") for p in sys.argv[1:]}, "cswap": cswap}))
 """
+
+
+# Runs inside `rex do`: one line per change worth a backup. Ordinary shell commands are left out,
+# so `ls` doesn't cost an SSH login. Claude's process is named after its version, such as 2.1.317.
+LISTEN_LUA = r"""
+local function interesting(name)
+  if not name then return false end
+  return name == "claude" or name == "btop" or name == "cswap"
+    or name:match("^%d+%.%d+%.%d+$") ~= nil or name:match("^python") ~= nil
+end
+local function emit(kind) print(rex.json.encode({ kind = kind })) end
+local last = {}
+rex.on("block_event", function(_, ev)
+  if ev.name ~= "process_changed" then return end
+  local name = ev.foreground and ev.foreground.name
+  local before = last[ev.block_id]
+  last[ev.block_id] = name
+  if name ~= before and (interesting(name) or interesting(before)) then emit("program") end
+end)
+for _, kind in ipairs({ "session_created", "session_destroyed", "window_created", "window_closed", "block_closed" }) do
+  rex.on(kind, function() emit(kind) end)
+end
+local _, err = rex.call("session.attach_all", { event_scope = "session" })
+if err then error(err, 0) end
+emit("ready")
+"""
+
+
+class Partial(Exception):
+    """The panes were saved, but not which Claude conversation each one holds."""
+
+
+@contextlib.contextmanager
+def locked(name):
+    with open(os.path.join(ROOT, name), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def now():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def run(*a, timeout=60, input=None):
@@ -120,6 +171,10 @@ def program_of(command):
     if len(words) == 2 and words[0].lower().startswith("python") and words[1] in PROGRAMS:
         return words[1]
     return None
+
+
+def is_office(command):
+    return bool(command) and "/quarterdeck/" in command
 
 
 def restart_program(host, x, name, apply_changes):
@@ -187,42 +242,61 @@ def blocks_of(view):
                     yield w, b
 
 
-def backup_host(host, folder):
+def backup_host(host, folder, scrollback=True):
     status = rex_json(host, "api", "call", "server.status")
     sessions, panes, screens = [], [], {}
     os.makedirs(os.path.join(folder, "scrollback"))
     for s in rex_json(host, "ls", "--json")["sessions"]:
         if not SAFE_ID.fullmatch(str(s.get("session_id"))):
             continue
-        view = rex_json(host, "api", "call", "-s", s["session_id"], "session.view")
+        # A session or pane can close while this runs: skip it rather than lose the host's whole backup.
+        try:
+            view = rex_json(host, "api", "call", "-s", s["session_id"], "session.view")
+        except RuntimeError:
+            continue
         sessions.append(view)
         for w, b in blocks_of(view):
             block = b["block_id"]
-            fg = foreground(host, s["session_id"], block)
-            states = rex_json(host, "block", "call", "program_status", "-s", s["session_id"], "-b", block).get("records") or []
+            try:
+                fg = foreground(host, s["session_id"], block)
+                states = rex_json(host, "block", "call", "program_status", "-s", s["session_id"], "-b", block).get("records") or []
+            except RuntimeError:
+                continue
             panes.append({"session_id": s["session_id"], "session": s.get("label"), "tab": w.get("label"), "block": block,
                           "pid": fg.get("pid"), "program": fg.get("name"), "shell": is_shell(fg), "cwd": fg.get("cwd"),
                           "state": states[0].get("state") if states else None})
+            # A quick backup reads only screens that may show cswap's mode, and keeps no scrollback.
+            if not scrollback and is_shell(fg):
+                continue
             p = rex(host, "capture", "-s", s["session_id"], "-b", block, "--trim", "--unwrap", timeout=120)
             if p.returncode == 0:
                 screens[block] = cswap_mode(p.stdout)
-                with gzip.open(os.path.join(folder, "scrollback", block.replace(":", "_") + ".txt.gz"), "wt") as f:
-                    f.write(p.stdout)
+                if scrollback:
+                    with gzip.open(os.path.join(folder, "scrollback", block.replace(":", "_") + ".txt.gz"), "wt") as f:
+                        f.write(p.stdout)
     # No panes, no SSH login: scheduled runs shouldn't log in through Warpgate for nothing.
-    live = probe(host, [x["pid"] for x in panes if x["pid"] and not x["shell"]]) if panes else {}
+    live, probe_error = {"claude": {}, "args": {}}, None
+    if panes:
+        try:
+            live = probe(host, [x["pid"] for x in panes if x["pid"] and not x["shell"]])
+        except Exception as e:
+            probe_error = str(e)
     agents = 0
     for x in panes:
         pid = str(x.pop("pid"))
         x["claude"] = live["claude"].get(pid)
         agents += bool(x["claude"])
-        if not x["shell"] and not x["claude"]:
+        if not x["shell"] and not x["claude"] and not probe_error:
             x["command"] = live["args"].get(pid, "")
             x["live"] = screens.get(x["block"]) == "LIVE"
-    manifest = {"host": host, "taken_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-                "server_started": status["started_at"], "server_instance": status["instance_id"],
+    manifest = {"host": host, "taken_at": now(), "server_started": status["started_at"],
+                "server_instance": status["instance_id"], "scrollback": scrollback, "incomplete": probe_error,
                 "sessions": sessions, "panes": panes}
     with open(os.path.join(folder, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
+    # Restore skips a backup with no conversations in it, so this one can't hide an older, complete one.
+    if probe_error:
+        raise Partial(f"{len(panes)} panes saved, but SSH failed, so not their conversations: {probe_error}")
     return len(sessions), len(panes), agents
 
 
@@ -254,23 +328,63 @@ def prune():
             shutil.rmtree(os.path.join(ROOT, old))
 
 
-def cmd_backup(args):
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    tmp = os.path.join(ROOT, "." + stamp)
-    os.makedirs(tmp)
+def record(host, error):
+    """Notifies once when a host's backups keep failing, and once when they work again."""
+    with locked(".failures.lock"):
+        state = load_json(FAILURES)
+        entry = state.get(host)
+        if error is None:
+            if entry and entry.get("alerted"):
+                notify(f"{host} is being backed up again")
+            state.pop(host, None)
+        else:
+            entry = entry or {"since": now(), "count": 0}
+            entry["count"] += 1
+            if entry["count"] >= ALERT_AFTER and not entry.get("alerted"):
+                entry["alerted"] = True
+                notify(f"{host} hasn't been backed up since {entry['since'][11:16]}: {CONTROL.sub(' ', error)[:120]}")
+            state[host] = entry
+        with open(FAILURES, "w") as f:
+            json.dump(state, f)
+
+
+def save_backup(hosts, scrollback=True):
+    tmp = tempfile.mkdtemp(prefix=".", dir=ROOT)
     failed = 0
-    for host in HOSTS:
+    for host in hosts:
         try:
-            n, panes, agents = backup_host(host, os.path.join(tmp, host))
+            n, panes, agents = backup_host(host, os.path.join(tmp, host), scrollback)
             print(f"{host}: {n} sessions, {panes} panes, {agents} Claude conversations")
+            record(host, None)
+        except Partial as e:
+            failed += 1
+            print(f"{host}: backed up in part: {e}", file=sys.stderr)
+            record(host, str(e))
         except Exception as e:
             failed += 1
             shutil.rmtree(os.path.join(tmp, host), ignore_errors=True)
             print(f"{host}: NOT backed up: {e}", file=sys.stderr)
-    os.rename(tmp, os.path.join(ROOT, stamp))
+            record(host, str(e))
+    if not os.listdir(tmp):
+        os.rmdir(tmp)
+        return failed
+    # The scheduled backup and the listener can finish in the same second.
+    for _ in range(5):
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            os.rename(tmp, os.path.join(ROOT, stamp))
+            break
+        except OSError:
+            time.sleep(1)
+    else:
+        raise RuntimeError(f"couldn't name the backup in {tmp}")
     prune()
-    print("saved", os.path.join(ROOT, stamp))
-    return 1 if failed else 0
+    print("saved", os.path.join(ROOT, stamp), flush=True)
+    return failed
+
+
+def cmd_backup(args):
+    return 1 if save_backup(HOSTS) else 0
 
 
 def cmd_list(args):
@@ -339,6 +453,10 @@ def restore_host(host, args):
             continue
         where = f"{x['session']} / {x['tab']}"
         name = program_of(x.get("command"))
+        # An office's bell restarts its session: reopening it here as well would run it twice.
+        if is_office(x.get("command")) or (x["claude"] and is_office(x["claude"].get("args"))):
+            print(f"  quarterdeck office, left to its bell: {where}")
+            continue
         if name:
             programs.append((x, name))
         elif x.get("command"):
@@ -422,32 +540,37 @@ def notify(text):
     run("osascript", "-e", script, text)
 
 
-def cmd_watch(args):
-    """Reopen a host's conversations once, when its server instance changes. The first sight of a host changes nothing."""
-    seen = load_json(WATCH_STATE)
-    for host in HOSTS:
-        p = run(REX, "--autostart=false", *([] if host == "local" else ["-S", host]), "api", "call", "server.status", timeout=20)
+def target(host):
+    return ["--autostart=false", *([] if host == "local" else ["-S", host])]
+
+
+def check_restart(host):
+    """Reopen a host's conversations once, when its server instance changes. The first sight of a host
+    changes nothing. The watcher and the listener both call this, so it holds a lock: only one reopens."""
+    with locked(".restore.lock"):
+        p = run(REX, *target(host), "api", "call", "server.status", timeout=20)
         if p.returncode:
-            continue
+            return
         instance = json.loads(p.stdout)["instance_id"]
+        seen = load_json(WATCH_STATE)
         previous = seen.get(host)
         if previous == instance:
-            continue
+            return
         # Saved first, so a failure part-way can't reopen things a second time on the next run.
         seen[host] = instance
         with open(WATCH_STATE, "w") as f:
             json.dump(seen, f)
         if previous is None:
-            continue
+            return
         stamp, m = choose(host, instance, None)
         if not m:
-            continue
+            return
         age = datetime.datetime.now().astimezone() - datetime.datetime.fromisoformat(m["taken_at"])
-        print(f"{datetime.datetime.now().isoformat(timespec='seconds')} {host}: server restarted", flush=True)
+        print(f"{now()} {host}: server restarted", flush=True)
         if age > datetime.timedelta(hours=WATCH_MAX_AGE_HOURS):
             print(f"{host}: backup is {age} old, so not reopening by itself", flush=True)
             notify(f"{host} restarted. Its backup is old: run rex-backup restore --host {host}")
-            continue
+            return
         try:
             problems = restore_host(host, argparse.Namespace(apply=True, session=None, stamp=stamp, keep_permissions=False))
         except Exception as e:
@@ -455,7 +578,72 @@ def cmd_watch(args):
             print(f"{host}: couldn't restore: {e}", flush=True)
         sys.stdout.flush()
         notify(f"{host} restarted and its sessions were reopened" + (f", with {problems} to check: see rex-backup.log" if problems else ""))
+
+
+def cmd_watch(args):
+    for host in HOSTS:
+        check_restart(host)
     return 0
+
+
+def cmd_listen(args):
+    """Follows each server's events. A change worth keeping schedules a quick backup of that host; a
+    dropped stream is retried, and once it's back a changed server instance means a restart."""
+    due, last = {}, {}
+    wake = threading.Condition()
+
+    def mark(host):
+        with wake:
+            due.setdefault(host, max(time.time() + DEBOUNCE, last.get(host, 0) + MIN_GAP))
+            wake.notify()
+
+    def follow(host):
+        delay, state = 5, None
+        while True:
+            started, reason = time.time(), ""
+            try:
+                check_restart(host)
+                p = subprocess.Popen([REX, *target(host), "do", "-", "--all"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+                p.stdin.write(LISTEN_LUA)
+                p.stdin.close()
+                for line in p.stdout:
+                    try:
+                        kind = json.loads(line).get("kind")
+                    except (ValueError, AttributeError):
+                        reason = line.strip()[:200] or reason
+                        continue
+                    if kind == "ready" and state != "up":
+                        state = "up"
+                        print(f"{now()} listen: {host}: following", flush=True)
+                    # Reconnecting backs up too, to catch what changed while the stream was down.
+                    mark(host)
+                p.wait()
+            except Exception as e:
+                reason = str(e)[:200]
+            if state != "down":
+                state = "down"
+                print(f"{now()} listen: {host}: lost, retrying: {reason}", flush=True)
+            delay = 5 if time.time() - started > 300 else min(delay * 2, 300)
+            time.sleep(delay)
+
+    for host in HOSTS:
+        threading.Thread(target=follow, args=(host,), daemon=True).start()
+    while True:
+        with wake:
+            ready = [h for h, t in due.items() if t <= time.time()]
+            if not ready:
+                wake.wait(timeout=min([t - time.time() for t in due.values()] + [60]))
+                continue
+            for h in ready:
+                del due[h]
+                last[h] = time.time()
+        print(f"{now()} listen: quick backup of {', '.join(ready)}", flush=True)
+        try:
+            save_backup(ready, scrollback=False)
+        except Exception as e:
+            print(f"{now()} listen: backup failed: {e}", flush=True)
+        sys.stderr.flush()
 
 
 def load_json(path):
@@ -475,6 +663,7 @@ def main():
     sub.add_parser("backup", help="save a backup (the default)")
     sub.add_parser("list", help="show the saved backups and their Claude counts")
     sub.add_parser("watch", help="reopen by itself when a server has restarted")
+    sub.add_parser("listen", help="follow every server: quick backups on changes, reopen after a restart")
     r = sub.add_parser("restore", help="reopen Claude conversations and allowed programs after a restart")
     r.add_argument("--apply", action="store_true", help="reopen them, rather than previewing")
     r.add_argument("--host", choices=list(HOSTS), help="only this host")
@@ -482,7 +671,7 @@ def main():
     r.add_argument("--stamp", help="use this backup, as shown by list")
     r.add_argument("--keep-permissions", action="store_true", help="also restore permission options the conversation was started with")
     args = ap.parse_args()
-    sys.exit({"list": cmd_list, "restore": cmd_restore, "watch": cmd_watch}.get(args.command, cmd_backup)(args))
+    sys.exit({"list": cmd_list, "restore": cmd_restore, "watch": cmd_watch, "listen": cmd_listen}.get(args.command, cmd_backup)(args))
 
 
 if __name__ == "__main__":
