@@ -40,6 +40,8 @@ WATCH_STATE = os.path.join(ROOT, ".server-instances.json")
 WATCH_MAX_AGE_HOURS = 24
 FAILURES = os.path.join(ROOT, ".failures.json")
 ALERT_AFTER = 2
+RESTORE_TRIES_STATE = os.path.join(ROOT, ".restore-tries.json")
+RESTORE_TRIES = 5
 # The listener backs a host up this long after the first change it sees, and no more often than MIN_GAP.
 DEBOUNCE, MIN_GAP = 30, 120
 # Claude options worth carrying over, with how many values each takes. Anything else, such as a
@@ -133,9 +135,10 @@ def probe(host, pids=()):
     pids = [str(p) for p in pids]
     alias = HOSTS[host]
     if alias:
-        p = run(*SSH, alias, "python3 - " + " ".join(pids), input=PROBE)
+        p = run(*SSH, alias, "python3 - " + " ".join(pids), input=PROBE, timeout=180)
     else:
-        p = run("python3", "-", *pids, input=PROBE)
+        # Just after a login the Mac can take over a minute to start Python.
+        p = run("python3", "-", *pids, input=PROBE, timeout=180)
     if p.returncode:
         raise RuntimeError((p.stderr or p.stdout).strip()[-200:])
     return json.loads(p.stdout)
@@ -548,7 +551,10 @@ def check_restart(host):
     """Reopen a host's conversations once, when its server instance changes. The first sight of a host
     changes nothing. The watcher and the listener both call this, so it holds a lock: only one reopens."""
     with locked(".restore.lock"):
-        p = run(REX, *target(host), "api", "call", "server.status", timeout=20)
+        try:
+            p = run(REX, *target(host), "api", "call", "server.status", timeout=20)
+        except subprocess.TimeoutExpired:
+            return  # a server that is still starting: the next run will see it
         if p.returncode:
             return
         instance = json.loads(p.stdout)["instance_id"]
@@ -574,15 +580,30 @@ def check_restart(host):
         try:
             problems = restore_host(host, argparse.Namespace(apply=True, session=None, stamp=stamp, keep_permissions=False))
         except Exception as e:
-            problems = 1
-            print(f"{host}: couldn't restore: {e}", flush=True)
+            # Restore skips conversations already running and panes not at a shell, so trying again is
+            # safe: the next run of the watcher or listener does, up to RESTORE_TRIES times.
+            tries = load_json(RESTORE_TRIES_STATE)
+            n = tries.get(host, {}).get(instance, 0) + 1
+            print(f"{host}: couldn't restore (try {n} of {RESTORE_TRIES}): {e}", flush=True)
+            if n < RESTORE_TRIES:
+                tries[host] = {instance: n}
+                seen[host] = previous
+                for path, data in ((RESTORE_TRIES_STATE, tries), (WATCH_STATE, seen)):
+                    with open(path, "w") as f:
+                        json.dump(data, f)
+                return
+            notify(f"{host} restarted, but its sessions couldn't be reopened: run rex-backup restore --apply --host {host}")
+            return
         sys.stdout.flush()
         notify(f"{host} restarted and its sessions were reopened" + (f", with {problems} to check: see rex-backup.log" if problems else ""))
 
 
 def cmd_watch(args):
     for host in HOSTS:
-        check_restart(host)
+        try:
+            check_restart(host)
+        except Exception as e:
+            print(f"{now()} watch: {host}: {e}", flush=True)
     return 0
 
 
@@ -624,7 +645,7 @@ def cmd_listen(args):
             if state != "down":
                 state = "down"
                 print(f"{now()} listen: {host}: lost, retrying: {reason}", flush=True)
-            delay = 5 if time.time() - started > 300 else min(delay * 2, 300)
+            delay = 5 if time.time() - started > 300 else min(delay * 2, 60)
             time.sleep(delay)
 
     for host in HOSTS:
