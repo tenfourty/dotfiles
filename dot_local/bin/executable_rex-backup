@@ -35,7 +35,7 @@ SSH = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 SHELLS = ("zsh", "bash", "sh", "fish")
 # Programs restore may start again, by these fixed names. Anything else could repeat something
 # destructive, so it's only listed for you to restart by hand.
-PROGRAMS = ("btop", "cswap")
+PROGRAMS = ("btop", "cswap", "rexboard")
 WATCH_STATE = os.path.join(ROOT, ".server-instances.json")
 WATCH_MAX_AGE_HOURS = 24
 FAILURES = os.path.join(ROOT, ".failures.json")
