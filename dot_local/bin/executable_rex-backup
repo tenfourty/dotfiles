@@ -9,7 +9,7 @@ can be reopened.
   rex-backup list                show the saved backups
   rex-backup restore             preview what would be reopened
   rex-backup restore --apply     reopen them
-  rex-backup watch               reopen them by itself when a server has restarted (run by launchd)
+  rex-backup watch               check once for restarted servers and reopen them (listen does this all the time)
   rex-backup listen              follow every server's events: a quick backup when Claude, btop or
                                  cswap starts or stops or a tab closes, and a reopen after a restart
 
