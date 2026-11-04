@@ -540,7 +540,12 @@ def cmd_restore(args):
 
 def notify(text):
     script = "on run argv\ndisplay notification (item 1 of argv) with title \"Rex\"\nend run"
-    run("osascript", "-e", script, text)
+    # A notification is never worth losing a backup or a restore over: on a Mac too loaded to show
+    # one in time, log it instead.
+    try:
+        run("osascript", "-e", script, text, timeout=20)
+    except Exception as e:
+        print(f"{now()} couldn't notify ({e.__class__.__name__}): {text}", flush=True)
 
 
 def target(host):
