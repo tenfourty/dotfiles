@@ -648,8 +648,17 @@ def cmd_listen(args):
             delay = 5 if time.time() - started > 300 else min(delay * 2, 60)
             time.sleep(delay)
 
+    def recheck():
+        # A stream that stays up never calls check_restart again, so a status read that timed out
+        # (a Mac still loading after boot) or a restore left to retry would otherwise wait for a
+        # reconnect that may never come. One status call per host a minute.
+        while True:
+            time.sleep(60)
+            cmd_watch(None)
+
     for host in HOSTS:
         threading.Thread(target=follow, args=(host,), daemon=True).start()
+    threading.Thread(target=recheck, daemon=True).start()
     while True:
         with wake:
             ready = [h for h, t in due.items() if t <= time.time()]
