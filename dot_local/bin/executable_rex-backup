@@ -61,7 +61,10 @@ for line in subprocess.run(["ps", "axww", "-o", "pid=,args="], capture_output=Tr
     if len(p) == 2:
         args[p[0]] = p[1]
 claude = {}
-for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+# SSH logs in as root on some hosts while Rex runs as another account (runcove-pmo), so look in
+# every home. Only the panes' own PIDs are looked up, so other people's Claude sessions don't matter.
+mine = os.path.expanduser("~/.claude/sessions/*.json")
+for f in sorted(set(glob.glob(mine) + glob.glob("/home/*/.claude/sessions/*.json"))):
     try:
         d = json.load(open(f))
         os.kill(int(d["pid"]), 0)
