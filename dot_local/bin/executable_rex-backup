@@ -26,7 +26,7 @@ Backups hold terminal scrollback, which can include secrets: they're in a privat
 import argparse, contextlib, datetime, fcntl, gzip, json, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
 
 # Rex host label -> SSH alias for reading Claude's session records. None is this Mac.
-HOSTS = {"local": None, "baba": "baba-herdr", "bifrost": "bifrost-herdr", "jbrown-dev": "jbrown-dev-herdr"}
+HOSTS = {"local": None, "baba": "baba-herdr", "bifrost": "bifrost-herdr", "jbrown-dev": "jbrown-dev-herdr", "runcove-pmo": "runcove-pmo-herdr"}
 ROOT = os.path.expanduser("~/.local/state/rex-backup")
 # The listener adds small backups between the scheduled ones, so this is a few days' worth.
 KEEP = 300
