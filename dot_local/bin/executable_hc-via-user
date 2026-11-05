@@ -1,0 +1,10 @@
+#!/bin/sh
+# hc machine add --via 'hc-via-user <ssh host> <account>': reach a machine over ssh as root, then run
+# hc's shell line there as another account through a login shell (runcove-pmo, 5 Nov 2026).
+# hc passes the line as the last argument and needs the bytes passed through untouched.
+set -eu
+host=$1 account=$2
+shift 2
+# runuser doesn't set the runtime directory; with linger on, the account's one exists.
+line=$(printf 'export XDG_RUNTIME_DIR=/run/user/$(id -u); %s' "$*" | sed "s/'/'\\\\''/g")
+exec ssh -T -o BatchMode=yes "$host" "exec runuser -l '$account' -c '$line'"
