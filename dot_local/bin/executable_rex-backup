@@ -572,8 +572,11 @@ def check_restart(host):
     changes nothing. The watcher and the listener both call this, so it holds a lock: only one reopens."""
     with locked(".restore.lock"):
         try:
-            p = run(REX, *target(host), "api", "call", "server.status", timeout=20)
+            # Just after a boot or an OS update the Mac can be loaded for minutes on end, and 20 s
+            # missed every try for a few minutes on 5 Nov.
+            p = run(REX, *target(host), "api", "call", "server.status", timeout=90)
         except subprocess.TimeoutExpired:
+            print(f"{now()} {host}: server status timed out, will check again", flush=True)
             return  # a server that is still starting: the next run will see it
         if p.returncode:
             return
