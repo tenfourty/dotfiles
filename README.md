@@ -120,6 +120,22 @@ Add Remote Host, as `unix://$HOME/.local/state/rex-tunnels/<host>.sock`.
 `dot_config/rex/rex-image-paste` is a copy of github.com/pablasso/rex-image-paste at 1d883ef with
 one local change, so read upstream's diff before updating it.
 
+## Claude Code guard hooks
+
+`dot_claude/hooks/executable_heredoc-guard` is a PreToolUse hook, wired up in
+`dot_claude/settings.json`, that refuses a heredoc whose body reuses its own
+delimiter: bash ends the outer heredoc at the inner terminator and runs the
+rest of the body as commands. It allows on any internal error. Tests live in
+`tests/`, which chezmoi does not install:
+
+```sh
+bash tests/heredoc-guard/test-heredoc-guard.sh
+```
+
+On macOS `settings.json` is still in the not-reconciled list in
+`.chezmoiignore`, so the hook file arrives there but is not active until that
+file is reconciled or the entry is added by hand.
+
 ## Verifying before a push
 
 ```sh

@@ -1,0 +1,206 @@
+#!/usr/bin/env -S python3 -I
+"""Claude Code PreToolUse hook (matcher: Bash).
+
+Refuses a Bash command when a heredoc body, as bash parses it, contains a
+heredoc opener that reuses the SAME delimiter and the outer heredoc was cut
+short by it. Bash ends the outer heredoc at the inner terminator line and then
+runs the rest of the "body" as commands; a closing delimiter line left over
+afterwards is the tell. A body that merely mentions its own delimiter and ends
+at its one terminator is ordinary text and is allowed.
+
+Exit 2 + stderr reason = block. Anything else (non-Bash tool, bad JSON, any
+internal error) = exit 0: the guard must never wedge a session.
+"""
+import json
+import re
+import sys
+
+WORD_STOP = set(" \t\n;&|<>()")
+
+
+def read_delim(s, i):
+    """Parse a heredoc delimiter word starting at s[i]. Returns (word, end)."""
+    n = len(s)
+    while i < n and s[i] in " \t":
+        i += 1
+    out = []
+    while i < n and s[i] not in WORD_STOP:
+        c = s[i]
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                j = n
+            out.append(s[i + 1:j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and s[j] != '"':
+                if s[j] == "\\" and j + 1 < n:
+                    j += 1
+                out.append(s[j])
+                j += 1
+            i = j + 1
+        elif c == "\\" and i + 1 < n:
+            out.append(s[i + 1])
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out), i
+
+
+def opener_pattern(delim):
+    return (r"(?<!<)<<-?[ \t]*(?:'" + re.escape(delim) + r"'|\"" + re.escape(delim)
+            + r"\"|\\?" + re.escape(delim) + r")(?![A-Za-z0-9_])")
+
+
+def same_delim_opener(body, delim):
+    return re.search(opener_pattern(delim), body) is not None
+
+
+def stray_terminator(rest, delim, strip):
+    """After a body ended early, is a delimiter line left with no opener of its own?
+
+    Counted by lines, not parsed: what follows was meant to be heredoc body, so
+    it is rarely balanced shell (an unclosed quote in embedded Python, say).
+    """
+    closers = sum((ln.lstrip("\t") if strip else ln) == delim
+                  for ln in rest.split("\n"))
+    return closers > len(re.findall(opener_pattern(delim), rest))
+
+
+def matching_paren(s, start):
+    """Index of the ')' matching the '(' at s[start], or -1."""
+    depth = 0
+    for j in range(start, len(s)):
+        if s[j] == "(":
+            depth += 1
+        elif s[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def find_bad_heredoc(s):
+    """Return the offending delimiter, or None."""
+    n = len(s)
+    i = 0
+    pending = []  # [(delim, strip_tabs)]
+    ctx = []  # open '"' strings and "(" groups, innermost last
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if s.startswith("$((", i):
+            j = matching_paren(s, i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if ctx and ctx[-1] == '"':
+            if c == '"':
+                ctx.pop()
+                i += 1
+            elif s.startswith("$(", i):  # commands run in here: "$(cat <<EOF ...)"
+                ctx.append("(")
+                i += 2
+            else:
+                i += 1
+            continue
+        if s.startswith("$'", i):
+            j = i + 2
+            while j < n and s[j] != "'":
+                j += 2 if s[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            ctx.append('"')
+            i += 1
+            continue
+        if s.startswith("${", i):
+            j = s.find("}", i)
+            i = i + 2 if j < 0 else j + 1
+            continue
+        if c == "#" and (i == 0 or s[i - 1] in " \t\n;&|("):
+            j = s.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if s.startswith("((", i):
+            j = matching_paren(s, i)
+            if j > 0 and s[j - 1] == ")" and "\n" not in s[i:j]:
+                i = j + 1
+                continue
+        if c == "(":
+            ctx.append("(")
+            i += 1
+            continue
+        if c == ")":
+            if ctx:
+                ctx.pop()
+            i += 1
+            continue
+        if s.startswith("<<<", i):
+            i += 3
+            continue
+        if s.startswith("<<", i):
+            i += 2
+            strip = False
+            if i < n and s[i] == "-":
+                strip = True
+                i += 1
+            word, i = read_delim(s, i)
+            if word:
+                pending.append((word, strip))
+            continue
+        if c == "\n" and pending:
+            i += 1
+            for delim, strip in pending:
+                body_lines = []
+                terminated = False
+                while i < n:
+                    j = s.find("\n", i)
+                    line = s[i:] if j < 0 else s[i:j]
+                    i = n if j < 0 else j + 1
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        terminated = True
+                        break
+                    body_lines.append(line)
+                if same_delim_opener("\n".join(body_lines), delim) and (
+                        not terminated or stray_terminator(s[i:], delim, strip)):
+                    return delim
+                if not terminated:
+                    return None
+            pending = []
+            continue
+        i += 1
+    return None
+
+
+def main():
+    try:
+        data = json.loads(sys.stdin.read())
+        if not isinstance(data, dict) or data.get("tool_name") != "Bash":
+            return 0
+        cmd = (data.get("tool_input") or {}).get("command")
+        if not isinstance(cmd, str) or "<<" not in cmd:
+            return 0
+        delim = find_bad_heredoc(cmd)
+    except Exception:
+        return 0
+    if delim is None:
+        return 0
+    sys.stderr.write(
+        "heredoc-guard: blocked. A heredoc delimited by '%s' contains another "
+        "'<<%s' opener; bash ends the outer heredoc at the first '%s' line and "
+        "runs the rest of the body as shell commands. Write the script to a "
+        "file (Write tool) and run that file, or give the outer heredoc a "
+        "distinct delimiter (e.g. PYEOF).\n" % (delim, delim, delim))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
