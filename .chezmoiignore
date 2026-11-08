@@ -28,6 +28,9 @@ me
 # README.md into $HOME.
 README.md
 
+# Tests for files in this repo; they must never be written into $HOME.
+tests
+
 # Copies of /etc/yum.repos.d files, consumed by run_onchange_10-repos.sh.
 # Not dotfiles; must never be written into $HOME.
 etc-repos
