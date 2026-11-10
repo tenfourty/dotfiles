@@ -1,0 +1,746 @@
+#!/usr/bin/env -S python3 -I
+"""claude-accounts: keep Jeremy's Claude Code accounts working on every machine with few browser sign-ins.
+
+  claude-accounts check [--only M] [--json]     what works where (read-only)
+  claude-accounts fix [--only M] [--dry-run]    ask only for what is broken, then put it right
+  claude-accounts sync-usage [--only M]         push the Mac's usage readings to the token machines
+
+The Mac holds real OAuth logins and is the only machine that can read usage. Every other machine holds
+setup-tokens (they do not rotate, so one token can sit on many machines) and adopts the Mac's readings with
+`cswap import-usage`. Config: ~/.config/claude-accounts/machines.toml (no secrets). Written by the
+jeremys-mac office, 10 Nov 2026; see the dotfiles README.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import dataclasses
+import fcntl
+import getpass
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+if sys.version_info < (3, 11):
+    sys.exit("claude-accounts needs Python 3.11 or newer (tomllib); put /opt/homebrew/bin first on PATH")
+import tomllib  # noqa: E402
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get("CLAUDE_ACCOUNTS_CONFIG", HOME / ".config/claude-accounts/machines.toml"))
+STATE = Path(os.environ.get("CLAUDE_ACCOUNTS_STATE", HOME / ".local/state/claude-accounts"))
+DEAD = {"relogin_required", "no_credentials", "foreign_credential"}
+BENIGN_COVE = ("No VM is named", "not running", "is stopped", "Stopped")
+
+
+# --------------------------------------------------------------------------- output
+
+def colour(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() and "NO_COLOR" not in os.environ else text
+
+
+def bold(t): return colour("1", t)
+def green(t): return colour("32", t)
+def red(t): return colour("31", t)
+def yellow(t): return colour("33", t)
+def dim(t): return colour("2", t)
+
+
+def say(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def tail(text: str, n: int = 160) -> str:
+    lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
+    return (lines[-1] if lines else "no output")[:n]
+
+
+# --------------------------------------------------------------------------- config
+
+@dataclasses.dataclass(frozen=True)
+class Account:
+    name: str
+    slot: int
+    email: str          # the login identity
+    org: str            # organisation name to tell same-email logins apart ("" = email alone is enough)
+    token_email: str    # the key a setup-token entry gets on token machines
+    login_args: tuple
+
+
+@dataclasses.dataclass(frozen=True)
+class Machine:
+    name: str
+    route: str          # local | ssh | cove
+    mode: str           # login | token
+    accounts: tuple
+    host: str = ""
+    vm: str = ""
+    user: str = ""
+    cswap: str = "cswap"
+    replace_dead_logins: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    accounts: dict
+    machines: dict
+    hold: int
+    reader: str
+    cove_bin: str
+    cove_context: str
+    timeout: int
+
+
+def load_config(path: Path = CONFIG) -> Config:
+    try:
+        raw = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        sys.exit(f"no config at {path}")
+    except tomllib.TOMLDecodeError as exc:
+        sys.exit(f"{path}: {exc}")
+    st = raw.get("settings", {})
+    accounts = {}
+    for name, a in raw.get("accounts", {}).items():
+        accounts[name] = Account(name, int(a["slot"]), a["email"], a.get("org", ""),
+                                 a.get("token_email", a["email"]), tuple(a.get("login_args", ())))
+    if len({a.slot for a in accounts.values()}) != len(accounts):
+        sys.exit(f"{path}: two accounts share a slot")
+    groups = raw.get("groups", {})
+    machines = {}
+    for name, m in raw.get("machines", {}).items():
+        accts = groups[m["accounts"]] if isinstance(m["accounts"], str) else m["accounts"]
+        bad = [x for x in accts if x not in accounts]
+        if bad or m["mode"] not in ("login", "token") or m["route"] not in ("local", "ssh", "cove"):
+            sys.exit(f"{path}: machine {name} is not valid (accounts {bad}, mode {m['mode']}, route {m['route']})")
+        if (m["route"] == "ssh" and "host" not in m) or (m["route"] == "cove" and not ("vm" in m and "user" in m)):
+            sys.exit(f"{path}: machine {name} needs host (ssh) or vm and user (cove)")
+        machines[name] = Machine(name, m["route"], m["mode"], tuple(accts), m.get("host", ""), m.get("vm", ""),
+                                 m.get("user", ""), m.get("cswap", "cswap"), bool(m.get("replace_dead_logins", False)))
+    reader = st.get("usage_reader", "mac")
+    if reader not in machines or machines[reader].mode != "login":
+        sys.exit(f"{path}: settings.usage_reader must name a login machine")
+    return Config(accounts, machines, int(st.get("hold_seconds", 1200)), reader,
+                  os.path.expanduser(st.get("cove_bin", "~/.cargo/bin/cove")),
+                  st.get("cove_context", ""), int(st.get("timeout_seconds", 90)))
+
+
+# --------------------------------------------------------------------------- transport
+
+class TransportError(Exception):
+    pass
+
+
+@dataclasses.dataclass
+class Result:
+    rc: int
+    out: str
+    err: str
+
+
+class Runner:
+    """Runs a shell line as the machine's account. Cove calls go one at a time and stop at the first
+    failure that is not plainly about one VM: cove-01's Warpgate blocks this address for 30 minutes after
+    5 failed logins, so a loop must never carry on over a failing login."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.cove_lock = threading.Lock()
+        self.cove_stopped = ""
+
+    def run(self, m: Machine, args: list, stdin: str | None = None, timeout: int | None = None) -> Result:
+        return self.line(m, shlex.join([m.cswap, *args]), stdin, timeout)
+
+    def line(self, m: Machine, line: str, stdin: str | None = None, timeout: int | None = None) -> Result:
+        timeout = timeout or self.cfg.timeout
+        try:
+            if m.route == "local":
+                p = subprocess.run(["bash", "-c", line], input=stdin, capture_output=True, text=True,
+                                   timeout=timeout, stdin=None if stdin is not None else subprocess.DEVNULL)
+                return Result(p.returncode, p.stdout, p.stderr)
+            if m.route == "ssh":
+                p = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", m.host, line],
+                                   input=stdin, capture_output=True, text=True, timeout=timeout,
+                                   stdin=None if stdin is not None else subprocess.DEVNULL)
+                if p.returncode == 255:
+                    raise TransportError(f"ssh {m.host}: {tail(p.stderr)}")
+                return Result(p.returncode, p.stdout, p.stderr)
+            return self._cove(m, line, stdin, timeout)
+        except subprocess.TimeoutExpired:
+            raise TransportError(f"timed out after {timeout}s")
+        except FileNotFoundError as exc:
+            raise TransportError(f"{exc.filename} not found")
+
+    def _cove(self, m: Machine, line: str, stdin: str | None, timeout: int) -> Result:
+        with self.cove_lock:
+            if self.cove_stopped:
+                raise TransportError(f"skipped, cove already failed ({self.cove_stopped})")
+            cmd = [self.cfg.cove_bin, "exec", "--json", "--timeout", str(timeout)]
+            if stdin is not None:
+                cmd.append("-i")
+            cmd += [m.vm, "--", "sudo", "-iu", m.user, "bash", "-lc", line]
+            env = dict(os.environ)
+            if self.cfg.cove_context:
+                env["COVE_CONTEXT"] = self.cfg.cove_context
+            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, env=env, timeout=timeout + 30,
+                               stdin=None if stdin is not None else subprocess.DEVNULL)
+            out, err, code = [], [], None
+            for ln in p.stdout.splitlines():
+                try:
+                    ev = json.loads(ln)
+                except ValueError:
+                    continue
+                if ev.get("type") == "stdout":
+                    out.append(ev["data"])
+                elif ev.get("type") == "stderr":
+                    err.append(ev["data"])
+                elif ev.get("type") == "exit":
+                    code = ev["data"]["code"]
+            if code is None:
+                reason = tail(p.stderr or p.stdout)
+                if not any(b in reason for b in BENIGN_COVE):
+                    self.cove_stopped = f"{m.vm}: {reason}"
+                raise TransportError(f"cove exec {m.vm}: {reason}")
+            return Result(code, "".join(out), "".join(err))
+
+
+def parse_json(text: str) -> dict:
+    i, j = text.find("{"), text.rfind("}")
+    if i < 0 or j < i:
+        raise ValueError("no JSON")
+    return json.loads(text[i:j + 1])
+
+
+# --------------------------------------------------------------------------- reading and matching
+
+@dataclasses.dataclass
+class State:
+    machine: Machine
+    error: str = ""
+    entries: list = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class Cell:
+    account: str
+    status: str         # ok | dead | missing
+    entry: dict | None = None
+    note: str = ""
+
+
+def read_machine(runner: Runner, m: Machine) -> State:
+    try:
+        r = runner.run(m, ["list", "--json"])
+    except TransportError as exc:
+        return State(m, str(exc))
+    try:
+        doc = parse_json(r.out)
+    except ValueError:
+        return State(m, f"cswap list --json gave no JSON (rc {r.rc}): {tail(r.err or r.out)}")
+    if "error" in doc:
+        return State(m, f"cswap: {doc['error'].get('message', doc['error'])}")
+    return State(m, entries=doc.get("accounts", []))
+
+
+def read_all(runner: Runner, cfg: Config, names: list) -> list:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        return list(pool.map(lambda n: read_machine(runner, cfg.machines[n]), names))
+
+
+def kind(entry: dict) -> str:
+    # Setup-tokens and API keys have no organisation; every OAuth login has one.
+    return "login" if entry.get("organizationUuid") else "token"
+
+
+def matches(a: Account, e: dict) -> bool:
+    if kind(e) == "token":
+        return e.get("email") == a.token_email
+    return e.get("email") == a.email and (not a.org or e.get("organizationName") == a.org)
+
+
+def assign(cfg: Config, m: Machine, entries: list) -> tuple:
+    remaining, cells = list(entries), {}
+    prefer = "token" if m.mode == "token" else "login"
+    for name in m.accounts:
+        a = cfg.accounts[name]
+        cands = sorted((e for e in remaining if matches(a, e)), key=lambda e: (kind(e) != prefer, e.get("number", 0)))
+        if not cands:
+            cells[name] = Cell(name, "missing")
+            continue
+        e = cands[0]
+        remaining.remove(e)
+        status, note = classify(m, e)
+        cells[name] = Cell(name, status, e, note)
+    return cells, remaining
+
+
+def classify(m: Machine, e: dict) -> tuple:
+    s = e.get("usageStatus")
+    if s in DEAD:
+        return "dead", ("login" if kind(e) == "login" and m.mode == "token" else "")
+    if m.mode == "login" and kind(e) == "token":
+        return "dead", "a token, not a login; the usage reader needs a login"
+    if s == "token_expired":
+        return "ok", "refresh pending"
+    return "ok", ("login" if m.mode == "token" and kind(e) == "login" else "")
+
+
+# --------------------------------------------------------------------------- check
+
+def cell_text(c: Cell | None) -> str:
+    if c is None:
+        return dim("-")
+    if c.status == "ok":
+        return green("ok") + (dim(f" ({c.note})") if c.note else "")
+    if c.status == "dead":
+        return red("dead") + (dim(f" ({c.note})") if c.note else "")
+    return yellow("missing")
+
+
+def strip_ansi(s: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
+def extra_label(e: dict) -> str:
+    return e.get("alias") or e.get("email", "?")
+
+
+def render_check(cfg: Config, states: list) -> str:
+    used = [n for n in cfg.accounts if any(n in s.machine.accounts for s in states)]
+    header = ["machine", "mode", *used, "extra"]
+    rows = []
+    for s in states:
+        m = s.machine
+        if s.error:
+            rows.append([m.name, m.mode] + [red("?")] * len(used) + [red("unreachable")])
+            continue
+        cells, extras = assign(cfg, m, s.entries)
+        rows.append([m.name, m.mode] + [cell_text(cells.get(n)) for n in used]
+                    + [", ".join(f"{extra_label(e)} ({kind(e)})" for e in extras) or dim("-")])
+    widths = [max(len(strip_ansi(r[i])) for r in [header, *rows]) for i in range(len(header))]
+    lines = []
+    for r in [header, *rows]:
+        lines.append("  ".join(c + " " * (w - len(strip_ansi(c))) for c, w in zip(r, widths)).rstrip())
+    lines[0] = bold(lines[0]) if sys.stdout.isatty() else lines[0]
+    for s in states:
+        if s.error:
+            lines.append(red(f"  {s.machine.name}: {s.error}"))
+    return "\n".join(lines)
+
+
+def sync_summary() -> str:
+    try:
+        d = json.loads((STATE / "status.json").read_text())
+    except (OSError, ValueError):
+        return "usage sync: no round recorded yet"
+    ok = sum(1 for v in d["machines"].values() if v.get("ok"))
+    age = int(time.time() - d["finished"])
+    bad = ", ".join(k for k, v in d["machines"].items() if not v.get("ok"))
+    return f"usage sync: last round {age // 60}m{age % 60:02d}s ago, {ok}/{len(d['machines'])} machines" + (f" (failed: {bad})" if bad else "")
+
+
+def pick(cfg: Config, only: str | None) -> list:
+    if only and only not in cfg.machines:
+        sys.exit(f"unknown machine {only!r}; known: {', '.join(cfg.machines)}")
+    return [only] if only else list(cfg.machines)
+
+
+def cmd_check(cfg: Config, args) -> int:
+    runner = Runner(cfg)
+    states = read_all(runner, cfg, pick(cfg, args.only))
+    if args.json:
+        out = {}
+        for s in states:
+            if s.error:
+                out[s.machine.name] = {"error": s.error}
+                continue
+            cells, extras = assign(cfg, s.machine, s.entries)
+            out[s.machine.name] = {"accounts": {n: {"status": c.status, "note": c.note} for n, c in cells.items()},
+                                   "extra": [extra_label(e) for e in extras]}
+        say(json.dumps(out, indent=2))
+    else:
+        say(render_check(cfg, states))
+        say()
+        say(dim("ok = usable; dead = re-login needed; missing = not on the machine; extra = on the machine but not configured; ? = unreachable"))
+        say(dim("(login) = an OAuth login where a token is configured. A token's own validity cannot be read without an inference request."))
+        say(dim(sync_summary()))
+    return 1 if any(s.error for s in states) else 0
+
+
+# --------------------------------------------------------------------------- plan
+
+@dataclasses.dataclass
+class TokenTarget:
+    machine: Machine
+    account: Account
+    reason: str
+    slot: int | None     # --slot to pass, None to refresh in place or let cswap pick
+    overwrite: bool      # the slot holds this account's dead login; answer cswap's overwrite prompt
+    note: str = ""
+
+
+@dataclasses.dataclass
+class Plan:
+    logins: list         # (machine, account, reason)
+    tokens: dict         # account name -> [TokenTarget]
+    notes: list
+
+    @property
+    def sign_ins(self) -> int:
+        return len(self.logins) + len(self.tokens)
+
+
+def build_plan(cfg: Config, states: list) -> Plan:
+    plan = Plan([], {}, [])
+    for s in states:
+        m = s.machine
+        if s.error:
+            plan.notes.append(f"{m.name}: unreachable ({s.error}); nothing planned for it")
+            continue
+        cells, extras = assign(cfg, m, s.entries)
+        if extras:
+            plan.notes.append(f"{m.name}: leaves alone {', '.join(f'{extra_label(e)} ({kind(e)})' for e in extras)} (present, not configured)")
+        occupied = {e.get("number") for e in s.entries}
+        for name, c in cells.items():
+            if c.status == "ok":
+                continue
+            a = cfg.accounts[name]
+            if m.mode == "login":
+                plan.logins.append((m, a, c.status))
+                continue
+            e = c.entry
+            if e is not None and kind(e) == "login":
+                if not m.replace_dead_logins:
+                    plan.notes.append(f"{m.name}: {name} is a dead OAuth login; replacing it with a token needs Jeremy's say-so, left alone")
+                    continue
+                if e.get("active"):
+                    plan.notes.append(f"{m.name}: {name} is the live account; never overwritten, left alone")
+                    continue
+                t = TokenTarget(m, a, c.status, e["number"], True, f"replaces the dead login in slot {e['number']}")
+            elif e is not None:
+                t = TokenTarget(m, a, c.status, None, False, "refreshes the token in place")
+            else:
+                slot = a.slot if a.slot not in occupied else None
+                t = TokenTarget(m, a, c.status, slot, False, f"new entry in slot {slot}" if slot else "new entry in the next free slot")
+            plan.tokens.setdefault(name, []).append(t)
+    return plan
+
+
+def render_plan(plan: Plan) -> str:
+    L = []
+    if plan.logins:
+        L.append(bold(f"Mac logins ({len(plan.logins)}): claude auth login in a private window, then cswap add"))
+        for m, a, why in plan.logins:
+            L.append(f"  {a.name:<9} {a.email}{f'  (organisation {a.org})' if a.org else ''}  [{why} on {m.name}]")
+    if plan.tokens:
+        L.append(bold(f"setup-token approvals ({len(plan.tokens)}): claude setup-token in a private window, once per account"))
+        for name, ts in plan.tokens.items():
+            a = ts[0].account
+            L.append(f"  {name:<9} {a.email}{f'  (organisation {a.org})' if a.org else ''}")
+            for t in ts:
+                L.append(f"      to {t.machine.name}: {t.reason}; {t.note}")
+    if not plan.logins and not plan.tokens:
+        L.append(green("Nothing to fix."))
+    else:
+        L.append(bold(f"Browser sign-ins in all: {plan.sign_ins}") + dim(f"  ({len(plan.logins)} login, {len(plan.tokens)} setup-token)"))
+    for n in plan.notes:
+        L.append(dim("  note: " + n))
+    return "\n".join(L)
+
+
+# --------------------------------------------------------------------------- fix
+
+def clear_screen() -> None:
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[2J\033[3J\033[H")
+        sys.stdout.flush()
+
+
+def ask(prompt: str, default_yes: bool = True) -> bool:
+    a = input(prompt + (" [Y/n] " if default_yes else " [y/N] ")).strip().lower()
+    return default_yes if not a else a.startswith("y")
+
+
+def mac_login(runner: Runner, m: Machine, a: Account, entry_slot: int | None, occupied: set) -> bool:
+    say(bold(f"\n=== {a.name}: log in on {m.name} ==="))
+    say(f"1. Open a private browser window and sign in to claude.ai as {bold(a.email)}"
+        + (f", organisation {bold(a.org)} (pick it on the consent screen)." if a.org else "."))
+    say("2. Press Enter: `claude auth login` starts. If it opens a normal window, copy its link into the private one.")
+    input("   [Enter to start] ")
+    if subprocess.call(["claude", "auth", "login", "--email", a.email, *a.login_args]) != 0:
+        say(red("   claude auth login failed"))
+        return False
+    p = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True)
+    try:
+        who = json.loads(p.stdout)
+    except ValueError:
+        say(red("   could not read claude auth status"))
+        return False
+    if who.get("email") != a.email or (a.org and who.get("orgName") != a.org):
+        say(red(f"   signed in as {who.get('email')} / {who.get('orgName')}, expected {a.email}"
+                + (f" / {a.org}" if a.org else "") + "; not adding it"))
+        return False
+    slot = entry_slot or (a.slot if a.slot not in occupied else None)
+    args = ["add", "--alias", a.name] + (["--slot", str(slot)] if slot else [])
+    r = runner.run(m, args, stdin="")     # EOF answers an overwrite prompt with "cancel", never "yes"
+    ok = r.rc == 0 and re.search(r"\b(Added|Updated credentials)\b", r.out) is not None
+    say((green("   added: ") if ok else red("   cswap add failed: ")) + tail(r.out if ok else (r.err or r.out)))
+    return ok
+
+
+def run_mac_logins(runner: Runner, cfg: Config, plan: Plan, states: dict) -> bool:
+    m = plan.logins[0][0]
+    entries = states[m.name].entries
+    cells, _ = assign(cfg, m, entries)
+    occupied = {e.get("number") for e in entries}
+    live = next((e for e in entries if e.get("active") and e.get("usageStatus") not in DEAD), None)
+    if live is not None and not any(matches(a, live) for _, a, _ in plan.logins):
+        # Save the live login before `claude auth login` replaces it, as `cswap switch` would; put it back after.
+        r = runner.run(m, ["add", "--slot", str(live["number"])], stdin="")
+        if r.rc != 0:
+            say(red(f"Could not save the live login first ({tail(r.err or r.out)}); not touching it."))
+            return False
+        say(dim(f"Saved the live login ({live.get('alias') or live['email']}, slot {live['number']}) so it can be put back."))
+    else:
+        live = None
+    ok = True
+    for _, a, _ in plan.logins:
+        e = cells[a.name].entry
+        ok &= mac_login(runner, m, a, e["number"] if e else None, occupied)
+    if live is not None:
+        say(dim(f"\nPutting the live login back: cswap switch {live['number']}"))
+        r = runner.run(m, ["switch", str(live["number"])], stdin="")
+        say((green("   done: ") if r.rc == 0 else red("   failed, run it by hand: ")) + tail(r.out if r.rc == 0 else (r.err or r.out)))
+        ok &= r.rc == 0
+    return ok
+
+
+def obtain_token(a: Account, have_token: bool) -> str:
+    say(bold(f"\n=== {a.name}: setup-token ==="))
+    if not have_token:
+        say(f"1. Open a private browser window and sign in to claude.ai as {bold(a.email)}"
+            + (f", organisation {bold(a.org)}." if a.org else "."))
+        say("2. Press Enter: `claude setup-token` starts. If it opens a normal window, copy its link into the private one.")
+        say("   Approve, and it prints a token (sk-ant-oat01-...).")
+        input("   [Enter to start] ")
+        subprocess.call(["claude", "setup-token"])
+        say()
+    token = getpass.getpass(f"{'3. ' if not have_token else ''}Paste {a.name}'s token here (hidden) and press Enter: ").strip()
+    if not token.startswith("sk-ant-oat"):
+        say(red("   that does not look like a setup-token (sk-ant-oat...); skipping this account"))
+        return ""
+    return token
+
+
+_age_cache: dict = {}
+
+
+def age_recipient(runner: Runner, m: Machine) -> str:
+    if m.name not in _age_cache:
+        r = runner.line(m, 'age-keygen -y "$HOME/.config/seat-secret/age.key"')
+        rcpt = tail(r.out)
+        if r.rc != 0 or not rcpt.startswith("age1"):
+            raise TransportError(f"no age key for {m.name}: {tail(r.err or r.out)}")
+        _age_cache[m.name] = rcpt
+    return _age_cache[m.name]
+
+
+def deliver(runner: Runner, token: str, t: TokenTarget) -> tuple:
+    m, a = t.machine, t.account
+    args = ["add-token", "-"] + (["--slot", str(t.slot)] if t.slot else []) + ["--email", a.token_email]
+    payload = token + "\n" + ("y\n" if t.overwrite else "")
+    try:
+        if m.route == "cove":
+            # Encrypted to the VM user's own age key before it leaves the Mac; nothing lands on the VM's disk.
+            if not shutil.which("age"):
+                raise TransportError("age is not installed here")
+            rcpt = age_recipient(runner, m)
+            enc = subprocess.run(["age", "-a", "-r", rcpt], input=payload, capture_output=True, text=True)
+            if enc.returncode != 0:
+                raise TransportError("age could not encrypt")
+            line = f'set -o pipefail; age -d -i "$HOME/.config/seat-secret/age.key" | {shlex.join([m.cswap, *args])}'
+            r = runner.line(m, line, stdin=enc.stdout)
+        else:
+            r = runner.run(m, args, stdin=payload)      # ssh's stdin is already encrypted in transit
+    except TransportError as exc:
+        return False, str(exc)
+    if r.rc != 0 or not re.search(r"\b(Added|Updated token)\b", r.out):
+        return False, tail(r.err or r.out)
+    # Name the entry, unless the machine already has that alias on something.
+    st = read_machine(runner, m)
+    mine = next((e for e in st.entries if kind(e) == "token" and e.get("email") == a.token_email), None)
+    if mine and not mine.get("alias") and not any(e.get("alias") == a.name for e in st.entries):
+        runner.run(m, ["alias", str(mine["number"]), a.name])
+    return True, tail(r.out)
+
+
+def cmd_fix(cfg: Config, args) -> int:
+    runner = Runner(cfg)
+    names = pick(cfg, args.only)
+    states = read_all(runner, cfg, names)
+    plan = build_plan(cfg, states)
+    say(render_plan(plan))
+    if args.dry_run or not (plan.logins or plan.tokens):
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("fix is interactive: run it in a terminal on the Mac (or use --dry-run)")
+    if not ask("\nGo ahead?"):
+        return 1
+    by_name = {s.machine.name: s for s in states}
+    failed = False
+    if plan.logins:
+        say(dim("\nThe Mac's live login changes while you do these, and is put back at the end (cswap switch)."))
+        failed |= not run_mac_logins(runner, cfg, plan, by_name)
+    for name, targets in plan.tokens.items():
+        clear_screen()
+        a = cfg.accounts[name]
+        token = obtain_token(a, args.have_tokens)
+        if not token:
+            failed = True
+            continue
+        todo = list(targets)
+        for attempt in range(3):
+            left = []
+            for t in todo:
+                ok, msg = deliver(runner, token, t)
+                say(f"   {green(t.machine.name + ': ' + name + ' added') if ok else red(t.machine.name + ': ' + name + ' failed (' + msg + ')')}")
+                if not ok:
+                    left.append(t)
+            todo = left
+            if not todo or not ask(f"   Retry {len(todo)} failed delivery(ies) with the same token?"):
+                break
+        failed |= bool(todo)
+        token = ""
+        input("   [Enter for the next account] ")
+    clear_screen()
+    say(bold("Where things stand now:"))
+    say(render_check(cfg, read_all(runner, cfg, names)))
+    say(dim("\nThe usage timer pushes the new accounts' readings within 5 minutes (or run: claude-accounts sync-usage)."))
+    return 1 if failed else 0
+
+
+# --------------------------------------------------------------------------- sync-usage
+
+def usage_doc(cfg: Config, m: Machine, readings: dict, elapsed: float) -> tuple:
+    """The Mac's readings as `cswap list --json` rows `import-usage` will match on the target: it keys on
+    (email, organisation uuid), so each account goes in twice, as a login and as a token entry."""
+    rows = []
+    for name in m.accounts:
+        r = readings.get(name)
+        if not r:
+            continue
+        a = cfg.accounts[name]
+        base = {"usageStatus": "ok", "usageAgeSeconds": round(r["usageAgeSeconds"] + elapsed, 1), "usage": r["usage"]}
+        rows.append({"email": r["email"], "organizationUuid": r.get("organizationUuid", ""), **base})
+        rows.append({"email": a.token_email, "organizationUuid": "", **base})
+    return json.dumps({"schemaVersion": 1, "accounts": rows}), len(rows) // 2
+
+
+def readings_from(cfg: Config, reader: Machine, entries: list) -> dict:
+    cells, _ = assign(cfg, reader, entries)
+    out = {}
+    for name, c in cells.items():
+        e = c.entry
+        if c.status == "ok" and e and e.get("usageStatus") == "ok" and isinstance(e.get("usageAgeSeconds"), (int, float)) and e.get("usage"):
+            out[name] = e
+    return out
+
+
+class Log:
+    def __init__(self, to_file: bool):
+        self.file = None
+        if to_file:
+            STATE.mkdir(parents=True, exist_ok=True)
+            path = STATE / "sync-usage.log"
+            try:
+                if path.stat().st_size > 200_000:
+                    path.write_text("".join(path.read_text().splitlines(True)[-500:]))
+            except OSError:
+                pass
+            self.file = path.open("a")
+
+    def __call__(self, msg: str) -> None:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+        (self.file or sys.stdout).write(line + "\n")
+        (self.file or sys.stdout).flush()
+
+
+def cmd_sync_usage(cfg: Config, args) -> int:
+    log = Log(args.quiet)
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = (STATE / "sync-usage.lock").open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another sync-usage is running; skipping this round")
+        return 0
+    runner = Runner(cfg)
+    reader = cfg.machines[cfg.reader]
+    t0 = time.time()
+    st = read_machine(runner, reader)
+    if st.error:
+        log(f"cannot read {reader.name}'s usage: {st.error}")
+        return 1
+    readings = readings_from(cfg, reader, st.entries)
+    log(f"{reader.name}: {len(readings)} fresh readings ({', '.join(readings) or 'none'})")
+    if not readings:
+        return 0
+    targets = [n for n in pick(cfg, args.only) if cfg.machines[n].mode == "token"]
+    results = {}
+
+    def push(name: str) -> tuple:
+        m = cfg.machines[name]
+        doc, n = usage_doc(cfg, m, readings, time.time() - t0)
+        if not n:
+            return name, True, "no readings for its accounts"
+        if args.dry_run:
+            return name, True, f"would push {n} account(s)"
+        try:
+            r = runner.run(m, ["import-usage", "-", "--hold", str(cfg.hold)], stdin=doc)
+        except TransportError as exc:
+            return name, False, str(exc)
+        summary = next((ln for ln in (r.err + r.out).splitlines() if ln.startswith("Done:")), tail(r.err or r.out))
+        return name, r.rc == 0, summary
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        for name, ok, msg in pool.map(push, targets):
+            results[name] = {"ok": ok, "message": msg}
+            log(f"{'ok  ' if ok else 'FAIL'} {name}: {msg}")
+    if not args.dry_run and not args.only:
+        (STATE / "status.json").write_text(json.dumps({"finished": time.time(), "machines": results}))
+    return 0 if all(v["ok"] for v in results.values()) else 1
+
+
+# --------------------------------------------------------------------------- main
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="claude-accounts", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check", help="what works where (read-only)")
+    c.add_argument("--only", metavar="MACHINE")
+    c.add_argument("--json", action="store_true")
+    f = sub.add_parser("fix", help="ask only for what is broken, then put it right")
+    f.add_argument("--only", metavar="MACHINE")
+    f.add_argument("--dry-run", action="store_true", help="print what it would ask for and change nothing")
+    f.add_argument("--have-tokens", action="store_true", help="paste setup-tokens you already hold instead of making new ones")
+    s = sub.add_parser("sync-usage", help="push the Mac's usage readings to the token machines")
+    s.add_argument("--only", metavar="MACHINE")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--quiet", action="store_true", help="log to ~/.local/state/claude-accounts/sync-usage.log (for the timer)")
+    args = p.parse_args(argv)
+    cfg = load_config()
+    try:
+        return {"check": cmd_check, "fix": cmd_fix, "sync-usage": cmd_sync_usage}[args.cmd](cfg, args)
+    except KeyboardInterrupt:
+        say("\ninterrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

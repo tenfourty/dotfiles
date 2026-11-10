@@ -83,10 +83,13 @@ etc-repos
 {{- end }}
 
 {{- if ne .chezmoi.os "darwin" }}
-# Rex client setup for the Mac: its launchd jobs, tunnels and clipboard action are Mac-only.
+# Rex client setup and claude-accounts for the Mac: launchd jobs, tunnels, clipboard action and the account
+# tool are Mac-only.
 .config/rex
 .local/bin/rex-backup
 .local/bin/rex-waiting
 .local/state/rex-tunnels
 Library
+.local/bin/claude-accounts
+.config/claude-accounts
 {{- end }}

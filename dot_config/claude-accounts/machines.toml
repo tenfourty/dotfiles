@@ -1,0 +1,159 @@
+# claude-accounts: which Claude Code accounts belong on which machine. No secrets here.
+# Read by ~/.local/bin/claude-accounts (check, fix, sync-usage). See the dotfiles README.
+
+[settings]
+usage_reader = "mac"        # the one machine holding real OAuth logins; it alone can read usage
+hold_seconds = 1200         # cswap import-usage --hold: four 5-minute rounds. Covers three missed rounds, then
+                            # lapses (cswap also caps a hold at one hour and at the window's reset)
+timeout_seconds = 90
+cove_bin = "~/.cargo/bin/cove"          # 0.28.2; ~/.local/bin/cove is an old 0.22.0
+cove_context = "cove.tenfourty.site"
+
+# The seven accounts. slot is baba's numbering. email/org identify the login; token_email is the key a
+# setup-token entry gets on token machines (a token has no organisation, so the two GitGuardian accounts,
+# which share an email, need distinct ones).
+[accounts.gg]
+slot = 1
+email = "jeremy.brown@gitguardian.com"
+org = "GitGuardian"
+token_email = "gg@token.local"
+
+[accounts.gg-eng]
+slot = 2
+email = "jeremy.brown@gitguardian.com"
+org = "GitGuardian Engineering"
+token_email = "gg-eng@token.local"
+
+[accounts.personal]
+slot = 3
+email = "jeremy@tenfourty.com"
+
+[accounts.max01]
+slot = 4
+email = "max01@tenfourty.com"
+
+[accounts.max02]
+slot = 5
+email = "max02@tenfourty.com"
+
+[accounts.max03]
+slot = 6
+email = "max03@tenfourty.com"
+
+[accounts.max04]
+slot = 7
+email = "max04@tenfourty.com"
+
+[groups]
+all = ["gg", "gg-eng", "personal", "max01", "max02", "max03", "max04"]
+max = ["max01", "max02", "max03", "max04"]
+
+# mode = "login": real OAuth logins (claude auth login, then cswap add). mode = "token": setup-tokens
+# (claude setup-token, cswap add-token), which can be copied to any number of machines.
+
+[machines.mac]
+route = "local"
+mode = "login"
+accounts = "all"
+
+# baba still holds all seven as live OAuth logins. Only max01..max04 are configured here, so check shows
+# gg, gg-eng and personal as "extra", and fix never touches, removes or switches any entry on baba.
+[machines.baba]
+route = "ssh"
+host = "baba"
+mode = "token"
+accounts = "max"
+
+# root's cswap; gg and gg-eng are dead logins here, which fix may replace with tokens (never the live account).
+[machines.jbrown-dev]
+route = "ssh"
+host = "jbrown-dev-herdr"
+cswap = "/root/.local/bin/cswap"
+mode = "token"
+accounts = "all"
+replace_dead_logins = true
+
+# Office VMs on cove-01: cove exec <vm> -- sudo -iu <user> bash -lc '...'
+[machines.harland]
+route = "cove"
+vm = "harland"
+user = "harland"
+mode = "token"
+accounts = "max"
+
+[machines.wolff]
+route = "cove"
+vm = "wolff"
+user = "wolff"
+mode = "token"
+accounts = "max"
+
+[machines.ch-maintainer]
+route = "cove"
+vm = "ch-maintainer"
+user = "ch"
+mode = "token"
+accounts = "max"
+
+[machines.cove]
+route = "cove"
+vm = "cove"
+user = "cove"
+mode = "token"
+accounts = "max"
+
+[machines.warpgate-maintainer]
+route = "cove"
+vm = "warpgate-maintainer"
+user = "warpgate"
+mode = "token"
+accounts = "max"
+
+[machines.runcove-pmo]
+route = "cove"
+vm = "runcove-pmo"
+user = "runcove-pmo"
+mode = "token"
+accounts = "max"
+
+[machines.qa-office]
+route = "cove"
+vm = "qa-office"
+user = "qa"
+mode = "token"
+accounts = "max"
+
+[machines.yarrow]
+route = "cove"
+vm = "yarrow"
+user = "yarrow"
+mode = "token"
+accounts = "max"
+
+[machines.security]
+route = "cove"
+vm = "security"
+user = "security"
+mode = "token"
+accounts = "max"
+
+[machines.ci-office]
+route = "cove"
+vm = "ci-office"
+user = "ci"
+mode = "token"
+accounts = "max"
+
+[machines.runcove-maintainer]
+route = "cove"
+vm = "runcove-maintainer"
+user = "runcove-maintainer"
+mode = "token"
+accounts = "max"
+
+[machines.cove-ops]
+route = "cove"
+vm = "cove-ops"
+user = "cove-ops"
+mode = "token"
+accounts = "max"
