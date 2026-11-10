@@ -58,9 +58,12 @@ accounts = "all"
 
 # baba still holds all seven as live OAuth logins. Only max01..max04 are configured here, so check shows
 # gg, gg-eng and personal as "extra", and fix never touches, removes or switches any entry on baba.
+# host is Jeremy's baba-herdr alias: the same lobby user and Linux account (tenfourty) as `ssh baba`, but a plain key
+# file. `ssh baba` signs through Secretive, whose public key sits in an app container that launchd jobs cannot
+# read, and which cannot sign while the Mac is locked: the timer would earn a Warpgate lockout (5 failures in 15 min).
 [machines.baba]
 route = "ssh"
-host = "baba"
+host = "baba-herdr"
 mode = "token"
 accounts = "max"
 

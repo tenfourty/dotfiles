@@ -92,4 +92,5 @@ etc-repos
 Library
 .local/bin/claude-accounts
 .config/claude-accounts
+.local/state/claude-accounts
 {{- end }}

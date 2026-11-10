@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>{{ .chezmoi.homeDir }}/.local/bin:{{ .chezmoi.homeDir }}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>SSH_AUTH_SOCK</key>
+		<string>{{ .chezmoi.homeDir }}/Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh</string>
+	</dict>
+	<key>Label</key>
+	<string>dev.claude-accounts.sync-usage</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{ .chezmoi.homeDir }}/.local/bin/claude-accounts</string>
+		<string>sync-usage</string>
+		<string>--quiet</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>{{ .chezmoi.homeDir }}/.local/state/claude-accounts/launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>{{ .chezmoi.homeDir }}/.local/state/claude-accounts/launchd.log</string>
+	<key>StartInterval</key>
+	<integer>300</integer>
+</dict>
+</plist>

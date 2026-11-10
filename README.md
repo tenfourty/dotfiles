@@ -120,6 +120,33 @@ Add Remote Host, as `unix://$HOME/.local/state/rex-tunnels/<host>.sock`.
 `dot_config/rex/rex-image-paste` is a copy of github.com/pablasso/rex-image-paste at 1d883ef with
 one local change, so read upstream's diff before updating it.
 
+## Claude accounts across machines
+
+`claude-accounts` (`dot_local/bin/executable_claude-accounts`, config in `dot_config/claude-accounts/machines.toml`,
+Mac only) keeps the seven Claude Code accounts working on every machine with as few browser sign-ins as possible.
+The Mac holds real OAuth logins for all seven (`gg`, `gg-eng`, `personal`, `max01`..`max04`) and is the only machine
+that reads usage. baba, jbrown-dev and the office VMs hold one-year setup-tokens (`claude setup-token`, then
+`cswap add-token`), one approval per account, delivered to every machine that needs it. baba's existing OAuth
+entries are never removed or switched: they show as "extra".
+
+```sh
+claude-accounts check              # what works where (read-only)
+claude-accounts fix --dry-run      # what it would ask you to approve; sends nothing
+claude-accounts fix                # interactive, in a terminal on the Mac
+claude-accounts sync-usage         # push the Mac's usage readings to the token machines now
+```
+
+The launchd job `dev.claude-accounts.sync-usage` runs `sync-usage` every 5 minutes (`cswap list --json` on the Mac,
+then `cswap import-usage <file> --hold 1200` on each token machine). Like the Rex jobs, `chezmoi apply` writes it
+but does not load it: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.claude-accounts.sync-usage.plist`.
+Its log is `~/.local/state/claude-accounts/sync-usage.log`.
+
+Two things that bite a launchd job here. baba is reached as `baba-herdr` (plain key `~/.ssh/herdr_baba`), not
+`baba`: Secretive's public key sits in an app container that launchd jobs may not read, and Secretive cannot sign
+while the Mac is locked, so a failing timer would earn a Warpgate block (5 failed logins in 15 minutes). The timer
+also sits out 30 minutes after any refused SSH login. Text from other machines is printed through `clean()`, which
+turns control characters into `?`. Tests: `PATH=/opt/homebrew/bin:$PATH bash tests/claude-accounts/test-claude-accounts.sh`.
+
 ## Claude Code guard hooks
 
 `dot_claude/hooks/executable_heredoc-guard` is a PreToolUse hook, wired up in

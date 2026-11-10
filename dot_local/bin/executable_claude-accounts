@@ -36,6 +36,7 @@ HOME = Path.home()
 CONFIG = Path(os.environ.get("CLAUDE_ACCOUNTS_CONFIG", HOME / ".config/claude-accounts/machines.toml"))
 STATE = Path(os.environ.get("CLAUDE_ACCOUNTS_STATE", HOME / ".local/state/claude-accounts"))
 DEAD = {"relogin_required", "no_credentials", "foreign_credential"}
+SSH_REFUSED_PAUSE = 1800     # seconds the timer keeps away from a host that refused its key
 BENIGN_COVE = ("No VM is named", "not running", "is stopped", "Stopped")
 
 
@@ -56,9 +57,21 @@ def say(msg: str = "") -> None:
     print(msg, flush=True)
 
 
+# Text from other machines (cswap output, aliases, emails, error messages) must never reach the terminal
+# raw: an ESC or C1 control in it could move the cursor, retitle the window or forge a line of this table.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def clean(text, multiline: bool = False) -> str:
+    """Replace control characters (and line or direction overrides) with '?'. Single-line by default;
+    multiline keeps \\n for output that is meant to span lines."""
+    s = _CONTROL.sub("?", str(text))
+    return s if multiline else s.replace("\n", " ").replace("\t", " ")
+
+
 def tail(text: str, n: int = 160) -> str:
     lines = [ln for ln in (text or "").strip().splitlines() if ln.strip()]
-    return (lines[-1] if lines else "no output")[:n]
+    return clean((lines[-1] if lines else "no output")[:n])
 
 
 # --------------------------------------------------------------------------- config
@@ -148,10 +161,23 @@ class Runner:
     failure that is not plainly about one VM: cove-01's Warpgate blocks this address for 30 minutes after
     5 failed logins, so a loop must never carry on over a failing login."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, unattended: bool = False):
         self.cfg = cfg
+        self.unattended = unattended      # the timer: sit out SSH_REFUSED_PAUSE after a refused login
         self.cove_lock = threading.Lock()
         self.cove_stopped = ""
+
+    def _refused_file(self, m: Machine) -> Path:
+        return STATE / f"ssh-refused-{m.host}"
+
+    def _check_refused(self, m: Machine) -> None:
+        try:
+            age = time.time() - self._refused_file(m).stat().st_mtime
+        except OSError:
+            return
+        if self.unattended and age < SSH_REFUSED_PAUSE:
+            raise TransportError(f"skipped, ssh {m.host} was refused {int(age // 60)} min ago (retry after "
+                                 f"{SSH_REFUSED_PAUSE // 60} min: Warpgate blocks an address after repeated failed logins)")
 
     def run(self, m: Machine, args: list, stdin: str | None = None, timeout: int | None = None) -> Result:
         return self.line(m, shlex.join([m.cswap, *args]), stdin, timeout)
@@ -164,11 +190,16 @@ class Runner:
                                    timeout=timeout, stdin=None if stdin is not None else subprocess.DEVNULL)
                 return Result(p.returncode, p.stdout, p.stderr)
             if m.route == "ssh":
+                self._check_refused(m)
                 p = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", m.host, line],
                                    input=stdin, capture_output=True, text=True, timeout=timeout,
                                    stdin=None if stdin is not None else subprocess.DEVNULL)
                 if p.returncode == 255:
+                    if "Permission denied" in p.stderr:
+                        STATE.mkdir(parents=True, exist_ok=True)
+                        self._refused_file(m).touch()
                     raise TransportError(f"ssh {m.host}: {tail(p.stderr)}")
+                self._refused_file(m).unlink(missing_ok=True)
                 return Result(p.returncode, p.stdout, p.stderr)
             return self._cove(m, line, stdin, timeout)
         except subprocess.TimeoutExpired:
@@ -237,13 +268,14 @@ def read_machine(runner: Runner, m: Machine) -> State:
     try:
         r = runner.run(m, ["list", "--json"])
     except TransportError as exc:
-        return State(m, str(exc))
+        return State(m, clean(exc))
     try:
         doc = parse_json(r.out)
     except ValueError:
         return State(m, f"cswap list --json gave no JSON (rc {r.rc}): {tail(r.err or r.out)}")
     if "error" in doc:
-        return State(m, f"cswap: {doc['error'].get('message', doc['error'])}")
+        err = doc["error"]
+        return State(m, "cswap: " + clean(err.get("message", err) if isinstance(err, dict) else err))
     return State(m, entries=doc.get("accounts", []))
 
 
@@ -307,7 +339,7 @@ def strip_ansi(s: str) -> str:
 
 
 def extra_label(e: dict) -> str:
-    return e.get("alias") or e.get("email", "?")
+    return clean(e.get("alias") or e.get("email", "?"))
 
 
 def render_check(cfg: Config, states: list) -> str:
@@ -329,7 +361,7 @@ def render_check(cfg: Config, states: list) -> str:
     lines[0] = bold(lines[0]) if sys.stdout.isatty() else lines[0]
     for s in states:
         if s.error:
-            lines.append(red(f"  {s.machine.name}: {s.error}"))
+            lines.append(red(f"  {s.machine.name}: {clean(s.error)}"))
     return "\n".join(lines)
 
 
@@ -357,7 +389,7 @@ def cmd_check(cfg: Config, args) -> int:
         out = {}
         for s in states:
             if s.error:
-                out[s.machine.name] = {"error": s.error}
+                out[s.machine.name] = {"error": clean(s.error)}
                 continue
             cells, extras = assign(cfg, s.machine, s.entries)
             out[s.machine.name] = {"accounts": {n: {"status": c.status, "note": c.note} for n, c in cells.items()},
@@ -400,7 +432,7 @@ def build_plan(cfg: Config, states: list) -> Plan:
     for s in states:
         m = s.machine
         if s.error:
-            plan.notes.append(f"{m.name}: unreachable ({s.error}); nothing planned for it")
+            plan.notes.append(f"{m.name}: unreachable ({clean(s.error)}); nothing planned for it")
             continue
         cells, extras = assign(cfg, m, s.entries)
         if extras:
@@ -482,7 +514,7 @@ def mac_login(runner: Runner, m: Machine, a: Account, entry_slot: int | None, oc
         say(red("   could not read claude auth status"))
         return False
     if who.get("email") != a.email or (a.org and who.get("orgName") != a.org):
-        say(red(f"   signed in as {who.get('email')} / {who.get('orgName')}, expected {a.email}"
+        say(red(f"   signed in as {clean(who.get('email'))} / {clean(who.get('orgName'))}, expected {a.email}"
                 + (f" / {a.org}" if a.org else "") + "; not adding it"))
         return False
     slot = entry_slot or (a.slot if a.slot not in occupied else None)
@@ -568,7 +600,7 @@ def deliver(runner: Runner, token: str, t: TokenTarget) -> tuple:
         else:
             r = runner.run(m, args, stdin=payload)      # ssh's stdin is already encrypted in transit
     except TransportError as exc:
-        return False, str(exc)
+        return False, clean(exc)
     if r.rc != 0 or not re.search(r"\b(Added|Updated token)\b", r.out):
         return False, tail(r.err or r.out)
     # Name the entry, unless the machine already has that alias on something.
@@ -665,7 +697,7 @@ class Log:
             self.file = path.open("a")
 
     def __call__(self, msg: str) -> None:
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {clean(msg)}"
         (self.file or sys.stdout).write(line + "\n")
         (self.file or sys.stdout).flush()
 
@@ -679,7 +711,7 @@ def cmd_sync_usage(cfg: Config, args) -> int:
     except OSError:
         log("another sync-usage is running; skipping this round")
         return 0
-    runner = Runner(cfg)
+    runner = Runner(cfg, unattended=args.quiet)
     reader = cfg.machines[cfg.reader]
     t0 = time.time()
     st = read_machine(runner, reader)
@@ -703,8 +735,8 @@ def cmd_sync_usage(cfg: Config, args) -> int:
         try:
             r = runner.run(m, ["import-usage", "-", "--hold", str(cfg.hold)], stdin=doc)
         except TransportError as exc:
-            return name, False, str(exc)
-        summary = next((ln for ln in (r.err + r.out).splitlines() if ln.startswith("Done:")), tail(r.err or r.out))
+            return name, False, clean(exc)
+        summary = next((clean(ln)[:160] for ln in (r.err + r.out).splitlines() if ln.startswith("Done:")), tail(r.err or r.out))
         return name, r.rc == 0, summary
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
